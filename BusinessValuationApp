@@ -1,0 +1,619 @@
+import numpy_financial as npf
+from scipy.optimize import newton
+import os
+import sys
+import subprocess
+from pathlib import Path
+import tkinter as tk
+from tkinter import ttk, messagebox, simpledialog, filedialog
+import webbrowser
+
+
+def is_running_as_exe():
+    return getattr(sys, 'frozen', False)
+
+
+class BusinessValuationApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Business Valuation Tool")
+        self.root.geometry("1000x800")
+        self.style = ttk.Style()
+        self.style.theme_use('clam')
+
+        self.setup_ui()
+
+    def setup_ui(self):
+        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        header = ttk.Label(main_frame, text="Business Valuation Tool", font=('Helvetica', 16, 'bold'))
+        header.pack(pady=10)
+
+        self.notification = ttk.Label(main_frame, text="", foreground="red")
+        self.notification.pack()
+
+        self.notebook = ttk.Notebook(main_frame)
+        self.notebook.pack(fill=tk.BOTH, expand=True, pady=10)
+
+        self.setup_business_tab()
+        self.setup_bond_tab()
+        self.setup_re_tab()
+        self.setup_fcfe_tab()
+        self.setup_help_tab()
+
+        ttk.Button(main_frame, text="Создать EXE файл", command=create_exe).pack(pady=10)
+
+    def setup_business_tab(self):
+        tab = ttk.Frame(self.notebook)
+        self.notebook.add(tab, text="Оценка бизнеса/акций")
+
+        self.asset_type = tk.StringVar(value="бизнес")
+        self.period_type = tk.StringVar(value="стандарт")
+        self.custom_years = tk.StringVar()
+        self.cf_values = []
+        self.growth_rate = tk.StringVar(value="0.05")
+        self.custom_growth_rate = tk.StringVar(value="0.05")
+        self.discount_rate_type = tk.StringVar(value="manual")
+        self.discount_rate = tk.StringVar(value="0.1")
+        self.growth_rate_terminal = tk.StringVar(value="0.03")
+        self.voi = tk.StringVar(value="0")
+        self.price_paid = tk.StringVar()
+
+        ttk.Label(tab, text="Тип актива:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
+        ttk.Combobox(tab, textvariable=self.asset_type, values=["бизнес", "акция", "недвижимость"]).grid(row=0,
+                                                                                                         column=1,
+                                                                                                         sticky=tk.W,
+                                                                                                         padx=5, pady=5)
+
+        ttk.Label(tab, text="Период расчета:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
+        period_frame = ttk.Frame(tab)
+        period_frame.grid(row=1, column=1, sticky=tk.W, padx=5, pady=5)
+        ttk.Radiobutton(period_frame, text="Стандартный (4 года + терминальный год)",
+                        variable=self.period_type, value="стандарт", command=self.update_business_ui).pack(side=tk.LEFT)
+        ttk.Radiobutton(period_frame, text="Кастомный:", variable=self.period_type,
+                        value="кастомный", command=self.update_business_ui).pack(side=tk.LEFT)
+        ttk.Entry(period_frame, textvariable=self.custom_years, width=5).pack(side=tk.LEFT)
+        ttk.Label(period_frame, text="лет").pack(side=tk.LEFT)
+
+        # CF за 1 год
+        ttk.Label(tab, text="CF за 1 год:").grid(row=2, column=0, sticky=tk.W, padx=5, pady=5)
+        self.cf1_entry = ttk.Entry(tab, width=10)
+        self.cf1_entry.grid(row=2, column=1, sticky=tk.W, padx=5, pady=5)
+
+        # Годовой рост (разные для стандартного и кастомного периодов)
+        self.growth_frame = ttk.Frame(tab)
+        self.growth_frame.grid(row=3, column=0, columnspan=2, sticky=tk.W, padx=5, pady=5)
+
+        self.update_business_ui()
+
+        ttk.Label(tab, text="Ставка дисконтирования:").grid(row=4, column=0, sticky=tk.W, padx=5, pady=5)
+        discount_frame = ttk.Frame(tab)
+        discount_frame.grid(row=4, column=1, sticky=tk.W, padx=5, pady=5)
+        ttk.Radiobutton(discount_frame, text="Вручную:", variable=self.discount_rate_type, value="manual").pack(
+            side=tk.LEFT)
+        ttk.Entry(discount_frame, textvariable=self.discount_rate, width=5).pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(discount_frame, text="Рассчитать Re", variable=self.discount_rate_type,
+                        value="re", command=lambda: self.notebook.select(2)).pack(side=tk.LEFT)
+
+        ttk.Label(tab, text="Терминальный рост (g):").grid(row=5, column=0, sticky=tk.W, padx=5, pady=5)
+        ttk.Entry(tab, textvariable=self.growth_rate_terminal, width=5).grid(row=5, column=1, sticky=tk.W, padx=5,
+                                                                             pady=5)
+
+        ttk.Label(tab, text="VOI (непрофильные активы):").grid(row=6, column=0, sticky=tk.W, padx=5, pady=5)
+        ttk.Entry(tab, textvariable=self.voi, width=10).grid(row=6, column=1, sticky=tk.W, padx=5, pady=5)
+
+        ttk.Label(tab, text="Цена приобретения:").grid(row=7, column=0, sticky=tk.W, padx=5, pady=5)
+        ttk.Entry(tab, textvariable=self.price_paid, width=10).grid(row=7, column=1, sticky=tk.W, padx=5, pady=5)
+
+        ttk.Button(tab, text="Рассчитать", command=self.calculate_business_value).grid(row=8, column=0, columnspan=2,
+                                                                                       pady=10)
+
+        self.result_text = tk.Text(tab, height=15, width=90, state=tk.DISABLED)
+        self.result_text.grid(row=9, column=0, columnspan=2, padx=5, pady=5)
+
+    def update_business_ui(self):
+        # Очищаем фрейм с ростом
+        for widget in self.growth_frame.winfo_children():
+            widget.destroy()
+
+        if self.period_type.get() == "стандарт":
+            ttk.Label(self.growth_frame, text="Годовой рост CF во 2-5 годы (%):").pack(side=tk.LEFT)
+            ttk.Entry(self.growth_frame, textvariable=self.growth_rate, width=5).pack(side=tk.LEFT)
+        else:
+            ttk.Label(self.growth_frame, text="Годовой рост CF за кастомный период (%):").pack(side=tk.LEFT)
+            ttk.Entry(self.growth_frame, textvariable=self.custom_growth_rate, width=5).pack(side=tk.LEFT)
+
+    def setup_bond_tab(self):
+        tab = ttk.Frame(self.notebook)
+        self.notebook.add(tab, text="Оценка облигаций")
+
+        self.bond_years = tk.StringVar(value="1")
+        self.bond_cf_values = []
+        self.bond_price = tk.StringVar()
+        self.bond_nominal = tk.StringVar(value="1000")
+
+        ttk.Label(tab, text="Период до погашения (лет):").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
+        ttk.Entry(tab, textvariable=self.bond_years, width=5).grid(row=0, column=1, sticky=tk.W, padx=5, pady=5)
+
+        self.bond_years.trace_add("write", self.update_bond_cf_entries)
+
+        ttk.Label(tab, text="Купонные выплаты:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
+        self.bond_cf_frame = ttk.Frame(tab)
+        self.bond_cf_frame.grid(row=1, column=1, columnspan=2, sticky=tk.W, padx=5, pady=5)
+
+        self.bond_cf_entries = []
+        self.setup_bond_cf_entries(1)
+
+        ttk.Label(tab, text="Номинальная стоимость:").grid(row=2, column=0, sticky=tk.W, padx=5, pady=5)
+        ttk.Entry(tab, textvariable=self.bond_nominal, width=10).grid(row=2, column=1, sticky=tk.W, padx=5, pady=5)
+
+        ttk.Label(tab, text="Цена приобретения:").grid(row=3, column=0, sticky=tk.W, padx=5, pady=5)
+        ttk.Entry(tab, textvariable=self.bond_price, width=10).grid(row=3, column=1, sticky=tk.W, padx=5, pady=5)
+
+        ttk.Button(tab, text="Рассчитать YTM", command=self.calculate_bond_value).grid(row=4, column=0, columnspan=2,
+                                                                                       pady=10)
+
+        self.bond_result_text = tk.Text(tab, height=15, width=90, state=tk.DISABLED)
+        self.bond_result_text.grid(row=5, column=0, columnspan=2, padx=5, pady=5)
+
+    def update_bond_cf_entries(self, *args):
+        try:
+            years = float(self.bond_years.get())
+            full_years = int(years)
+            fractional_part = years - full_years
+
+            # Для нецелых лет добавляем дополнительный период
+            num_entries = full_years + 1 if fractional_part > 0 else full_years
+            self.setup_bond_cf_entries(num_entries)
+        except ValueError:
+            pass
+
+    def setup_bond_cf_entries(self, num_entries):
+        for widget in self.bond_cf_frame.winfo_children():
+            widget.destroy()
+
+        self.bond_cf_entries = []
+        for i in range(num_entries):
+            row = ttk.Frame(self.bond_cf_frame)
+            row.pack(fill=tk.X)
+
+            if i < num_entries - 1:
+                label_text = f"Купон {i + 1}:"
+            else:
+                label_text = f"Последний период:"
+
+            ttk.Label(row, text=label_text).pack(side=tk.LEFT)
+            entry = ttk.Entry(row, width=10)
+            entry.pack(side=tk.LEFT, padx=5)
+            self.bond_cf_entries.append(entry)
+
+    def setup_re_tab(self):
+        tab = ttk.Frame(self.notebook)
+        self.notebook.add(tab, text="Расчет Re")
+
+        self.beta_u = tk.StringVar(value="1.0")
+        self.tax_rate = tk.StringVar(value="0.2")
+        self.debt_value = tk.StringVar(value="100")
+        self.equity_value = tk.StringVar(value="100")
+        self.erp_usa = tk.StringVar(value="0.05")
+        self.us_intr = tk.StringVar(value="0.03")
+        self.country_rf = tk.StringVar(value="0.05")
+        self.country_data = []
+
+        ttk.Label(tab, text="Beta U (отраслевая бета без долга):").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
+        ttk.Entry(tab, textvariable=self.beta_u, width=10).grid(row=0, column=1, sticky=tk.W, padx=5, pady=5)
+
+        ttk.Label(tab, text="Налоговая ставка:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
+        ttk.Entry(tab, textvariable=self.tax_rate, width=10).grid(row=1, column=1, sticky=tk.W, padx=5, pady=5)
+
+        ttk.Label(tab, text="Рыночная стоимость долга (D):").grid(row=2, column=0, sticky=tk.W, padx=5, pady=5)
+        ttk.Entry(tab, textvariable=self.debt_value, width=10).grid(row=2, column=1, sticky=tk.W, padx=5, pady=5)
+
+        ttk.Label(tab, text="Рыночная стоимость капитала (E):").grid(row=3, column=0, sticky=tk.W, padx=5, pady=5)
+        ttk.Entry(tab, textvariable=self.equity_value, width=10).grid(row=3, column=1, sticky=tk.W, padx=5, pady=5)
+
+        ttk.Label(tab, text="ERP USA:").grid(row=4, column=0, sticky=tk.W, padx=5, pady=5)
+        ttk.Entry(tab, textvariable=self.erp_usa, width=10).grid(row=4, column=1, sticky=tk.W, padx=5, pady=5)
+
+        ttk.Label(tab, text="USINTR (безрисковая ставка США):").grid(row=5, column=0, sticky=tk.W, padx=5, pady=5)
+        ttk.Entry(tab, textvariable=self.us_intr, width=10).grid(row=5, column=1, sticky=tk.W, padx=5, pady=5)
+
+        ttk.Label(tab, text="Безрисковая ставка страны (Rf):").grid(row=6, column=0, sticky=tk.W, padx=5, pady=5)
+        ttk.Entry(tab, textvariable=self.country_rf, width=10).grid(row=6, column=1, sticky=tk.W, padx=5, pady=5)
+
+        ttk.Button(tab, text="Добавить страну", command=self.add_country).grid(row=7, column=0, columnspan=2, pady=10)
+
+        self.country_frame = ttk.Frame(tab)
+        self.country_frame.grid(row=8, column=0, columnspan=2, sticky=tk.W, padx=5, pady=5)
+
+        ttk.Button(tab, text="Рассчитать Re", command=self.calculate_re_gui).grid(row=9, column=0, columnspan=2,
+                                                                                  pady=10)
+
+        self.re_result_text = tk.Text(tab, height=10, width=90, state=tk.DISABLED)
+        self.re_result_text.grid(row=10, column=0, columnspan=2, padx=5, pady=5)
+
+    def setup_fcfe_tab(self):
+        tab = ttk.Frame(self.notebook)
+        self.notebook.add(tab, text="Расчет g FCFE")
+
+        self.fcfe_growth = tk.StringVar(value="0.1")
+        self.capex_prev = tk.StringVar(value="100")
+        self.ocf = tk.StringVar(value="200")
+        self.roic_fcfe = tk.StringVar()
+        self.reinv_rate = tk.StringVar()
+        self.g_fcfe = tk.StringVar()
+
+        ttk.Label(tab, text="Рост FCFE (FCFE Growth):").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
+        ttk.Entry(tab, textvariable=self.fcfe_growth, width=10).grid(row=0, column=1, sticky=tk.W, padx=5, pady=5)
+
+        ttk.Label(tab, text="CapEx предыдущего года:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
+        ttk.Entry(tab, textvariable=self.capex_prev, width=10).grid(row=1, column=1, sticky=tk.W, padx=5, pady=5)
+
+        ttk.Label(tab, text="Операционный денежный поток (OCF):").grid(row=2, column=0, sticky=tk.W, padx=5, pady=5)
+        ttk.Entry(tab, textvariable=self.ocf, width=10).grid(row=2, column=1, sticky=tk.W, padx=5, pady=5)
+
+        ttk.Button(tab, text="Рассчитать g FCFE", command=self.calculate_fcfe).grid(row=3, column=0, columnspan=2,
+                                                                                    pady=10)
+
+        ttk.Label(tab, text="ROIC FCFE:").grid(row=4, column=0, sticky=tk.W, padx=5, pady=5)
+        ttk.Entry(tab, textvariable=self.roic_fcfe, state='readonly', width=10).grid(row=4, column=1, sticky=tk.W,
+                                                                                     padx=5, pady=5)
+
+        ttk.Label(tab, text="Reinvestment Rate:").grid(row=5, column=0, sticky=tk.W, padx=5, pady=5)
+        ttk.Entry(tab, textvariable=self.reinv_rate, state='readonly', width=10).grid(row=5, column=1, sticky=tk.W,
+                                                                                      padx=5, pady=5)
+
+        ttk.Label(tab, text="g FCFE:").grid(row=6, column=0, sticky=tk.W, padx=5, pady=5)
+        ttk.Entry(tab, textvariable=self.g_fcfe, state='readonly', width=10).grid(row=6, column=1, sticky=tk.W, padx=5,
+                                                                                  pady=5)
+
+    def calculate_fcfe(self):
+        try:
+            fcfe_growth = float(self.fcfe_growth.get())
+            capex_prev = float(self.capex_prev.get())
+            ocf = float(self.ocf.get())
+
+            roic_fcfe = fcfe_growth / capex_prev if capex_prev != 0 else 0
+            reinv_rate = capex_prev / ocf if ocf != 0 else 0
+            g_fcfe = roic_fcfe * reinv_rate
+
+            self.roic_fcfe.set(f"{roic_fcfe:.4f}")
+            self.reinv_rate.set(f"{reinv_rate:.4f}")
+            self.g_fcfe.set(f"{g_fcfe:.4f}")
+
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Ошибка при расчете g FCFE: {str(e)}")
+
+    def add_country(self):
+        country_window = tk.Toplevel(self.root)
+        country_window.title("Добавить страну")
+
+        country_intr = tk.StringVar(value="0.05")
+        crp = tk.StringVar(value="0.03")
+        lambda_val = tk.StringVar(value="1.0")
+
+        ttk.Label(country_window, text="Безрисковая ставка страны:").grid(row=0, column=0, padx=5, pady=5)
+        ttk.Entry(country_window, textvariable=country_intr, width=10).grid(row=0, column=1, padx=5, pady=5)
+
+        ttk.Label(country_window, text="CRP (страновой риск премиум):").grid(row=1, column=0, padx=5, pady=5)
+        ttk.Entry(country_window, textvariable=crp, width=10).grid(row=1, column=1, padx=5, pady=5)
+
+        ttk.Label(country_window, text="Lambda (доля выручки):").grid(row=2, column=0, padx=5, pady=5)
+        ttk.Entry(country_window, textvariable=lambda_val, width=10).grid(row=2, column=1, padx=5, pady=5)
+
+        def save_country():
+            self.country_data.append({
+                'country_intr': float(country_intr.get()),
+                'crp': float(crp.get()),
+                'lambda_val': float(lambda_val.get())
+            })
+            self.update_country_list()
+            country_window.destroy()
+
+        ttk.Button(country_window, text="Сохранить", command=save_country).grid(row=3, column=0, columnspan=2, pady=10)
+
+    def update_country_list(self):
+        for widget in self.country_frame.winfo_children():
+            widget.destroy()
+
+        for i, country in enumerate(self.country_data):
+            row = ttk.Frame(self.country_frame)
+            row.pack(fill=tk.X)
+            ttk.Label(row,
+                      text=f"Страна {i + 1}: INTR={country['country_intr']}, CRP={country['crp']}, λ={country['lambda_val']}").pack(
+                side=tk.LEFT)
+
+            ttk.Button(row, text="Удалить", command=lambda idx=i: self.remove_country(idx)).pack(side=tk.RIGHT)
+
+    def remove_country(self, idx):
+        self.country_data.pop(idx)
+        self.update_country_list()
+
+    def calculate_business_value(self):
+        try:
+            asset_type = self.asset_type.get()
+
+            if self.period_type.get() == "стандарт":
+                years = 5  # 4 года + терминальный
+                use_standard_formula = True
+                growth_rate = float(self.growth_rate.get())
+            else:
+                years = float(self.custom_years.get())
+                use_standard_formula = False
+                growth_rate = float(self.custom_growth_rate.get())
+
+            cf_values = []
+            full_years = int(years)
+            fractional_part = years - full_years
+
+            cf1 = float(self.cf1_entry.get())
+            cf_values.append((cf1, 1.0))
+
+            if use_standard_formula:
+                # Стандартный расчет (4 года + терминальный)
+                for i in range(1, 5):
+                    cf = cf_values[-1][0] * (1 + growth_rate)
+                    cf_values.append((cf, 1.0))
+            else:
+                # Кастомный расчет
+                for i in range(1, full_years):
+                    cf = cf_values[-1][0] * (1 + growth_rate)
+                    cf_values.append((cf, 1.0))
+
+                if fractional_part > 0:
+                    cf = cf_values[-1][0] * (1 + growth_rate)
+                    cf_values.append((cf, fractional_part))
+
+            if self.discount_rate_type.get() == "manual":
+                k = float(self.discount_rate.get())
+            else:
+                k = self.calculate_re()
+
+            g = float(self.growth_rate_terminal.get())
+            voi = float(self.voi.get())
+            price_paid = float(self.price_paid.get())
+
+            ev = 0
+            if use_standard_formula:
+                for t in range(4):
+                    ev += cf_values[t][0] / ((1 + k) ** (t + 1))
+                terminal_value = (cf_values[4][0] * (1 + g)) / (k - g) / ((1 + k) ** 5)
+                ev += terminal_value
+            else:
+                time_passed = 0
+                for i, (cf, duration) in enumerate(cf_values):
+                    time_passed += duration
+                    ev += cf / ((1 + k) ** time_passed)
+            ev += voi
+
+            result = f"Результаты расчета:\n"
+            result += f"Тип актива: {asset_type}\n"
+            result += f"Период расчета: {years} лет\n"
+            result += f"Ставка дисконтирования (k): {k:.4f}\n"
+            result += f"Терминальный рост (g): {g:.4f}\n"
+            result += f"VOI: {voi:.2f}\n"
+            result += f"\nСтоимость (EV): {ev:.2f}\n"
+            result += f"Цена приобретения: {price_paid:.2f}\n"
+
+            difference = ev - price_paid
+            percent_difference = (difference / ev) * 100
+            result += f"\nРазница (EV - цена): {difference:.2f} ({percent_difference:.2f}% от EV)\n"
+
+            if difference > 0:
+                result += "✅ Вы приобрели актив дешевле его расчетной стоимости (EV > цена)"
+            elif difference < 0:
+                result += "⚠️ Вы приобрели актив дороже его расчетной стоимости (EV < цена)"
+            else:
+                result += "⚖️ Вы приобрели актив ровно по его расчетной стоимости (EV = цена)"
+
+            self.show_result(result)
+
+        except Exception as e:
+            self.show_error(f"Ошибка при расчете: {str(e)}")
+
+    def calculate_bond_value(self):
+        try:
+            years = float(self.bond_years.get())
+            full_years = int(years)
+            fractional_part = years - full_years
+
+            cf_values = []
+            for i in range(full_years):
+                cf = float(self.bond_cf_entries[i].get())
+                cf_values.append((cf, 1.0))
+
+            if fractional_part > 0:
+                cf = float(self.bond_cf_entries[full_years].get()) + float(self.bond_nominal.get())
+                cf_values.append((cf, fractional_part))
+            else:
+                cf_values[-1] = (cf_values[-1][0] + float(self.bond_nominal.get()), cf_values[-1][1])
+
+            price_paid = float(self.bond_price.get())
+
+            cashflows = [-price_paid] + [cf[0] for cf in cf_values]
+            durations = [cf[1] for cf in cf_values]
+            time_points = []
+            acc_time = 0
+            for d in durations:
+                acc_time += d
+                time_points.append(acc_time)
+
+            def ytm_func(r):
+                return sum(cf / (1 + r) ** t for cf, t in zip(cashflows[1:], time_points)) + cashflows[0]
+
+            try:
+                ytm = newton(ytm_func, x0=0.1)
+
+                result = f"Результаты расчета облигации:\n"
+                result += f"Период до погашения: {years:.2f} лет\n"
+                result += f"Цена приобретения: {price_paid:.2f}\n"
+                result += f"Номинальная стоимость: {float(self.bond_nominal.get()):.2f}\n"
+                result += f"\nДоходность к погашению (YTM): {ytm * 100:.2f}% годовых\n"
+
+                pv_cashflows = [cf / (1 + ytm) ** t for cf, t in zip(cashflows[1:], time_points)]
+                duration = sum(t * pv for t, pv in zip(time_points, pv_cashflows)) / sum(pv_cashflows)
+                result += f"Дюрация облигации: {duration:.2f} лет\n"
+
+                price_up = sum(cf / (1 + ytm + 0.01) ** t for cf, t in zip(cashflows[1:], time_points))
+                price_down = sum(cf / (1 + ytm - 0.01) ** t for cf, t in zip(cashflows[1:], time_points))
+
+                delta_up = price_up - price_paid
+                delta_down = price_down - price_paid
+                percent_up = (delta_up / price_paid) * 100
+                percent_down = (delta_down / price_paid) * 100
+
+                result += f"\n🔺 При увеличении ставки на 1%:\n"
+                result += f"- Новая цена: {price_up:.2f} (изменение: {delta_up:+.2f}, {percent_up:+.2f}%)\n"
+                result += f"\n🔻 При снижении ставки на 1%:\n"
+                result += f"- Новая цена: {price_down:.2f} (изменение: {delta_down:+.2f}, {percent_down:+.2f}%)\n"
+
+                self.show_bond_result(result)
+
+            except RuntimeError:
+                self.show_error("Не удалось точно рассчитать YTM. Попробуйте другие данные.")
+
+        except Exception as e:
+            self.show_error(f"Ошибка при расчете облигации: {str(e)}")
+
+    def calculate_re_gui(self):
+        try:
+            beta_u = float(self.beta_u.get())
+            tax = float(self.tax_rate.get())
+            D = float(self.debt_value.get())
+            E = float(self.equity_value.get())
+
+            beta_l = beta_u * (1 + (1 - tax) * (D / E))
+
+            erp_usa = float(self.erp_usa.get())
+            us_intr = float(self.us_intr.get())
+
+            erp_local = 0
+            for country in self.country_data:
+                country_erp = country['lambda_val'] * (
+                            (erp_usa + 1 * country['crp']) + (country['country_intr'] - us_intr))
+                erp_local += country_erp
+
+            rf = float(self.country_rf.get())
+            re = rf + beta_l * erp_local
+
+            result = f"Результаты расчета Re:\n"
+            result += f"Beta U: {beta_u:.4f}\n"
+            result += f"Beta L (левереджированная бета): {beta_l:.4f}\n"
+            result += f"ERP Local: {erp_local:.4f}\n"
+            result += f"Безрисковая ставка (Rf): {rf:.4f}\n"
+            result += f"\n✅ Итоговое значение Re = {re:.4f}\n"
+
+            self.discount_rate.set(f"{re:.4f}")
+            self.discount_rate_type.set("manual")
+
+            self.show_re_result(result)
+
+        except Exception as e:
+            self.show_error(f"Ошибка при расчете Re: {str(e)}")
+
+    def calculate_re(self):
+        try:
+            beta_u = float(self.beta_u.get())
+            tax = float(self.tax_rate.get())
+            D = float(self.debt_value.get())
+            E = float(self.equity_value.get())
+
+            beta_l = beta_u * (1 + (1 - tax) * (D / E))
+
+            erp_usa = float(self.erp_usa.get())
+            us_intr = float(self.us_intr.get())
+
+            erp_local = 0
+            for country in self.country_data:
+                country_erp = country['lambda_val'] * (
+                            (erp_usa + 1 * country['crp']) + (country['country_intr'] - us_intr))
+                erp_local += country_erp
+
+            rf = float(self.country_rf.get())
+            re = rf + beta_l * erp_local
+
+            return re
+
+        except Exception as e:
+            self.show_error(f"Ошибка при расчете Re: {str(e)}")
+            return 0.1
+
+    def show_result(self, text):
+        self.result_text.config(state=tk.NORMAL)
+        self.result_text.delete(1.0, tk.END)
+        self.result_text.insert(tk.END, text)
+        self.result_text.config(state=tk.DISABLED)
+
+    def show_bond_result(self, text):
+        self.bond_result_text.config(state=tk.NORMAL)
+        self.bond_result_text.delete(1.0, tk.END)
+        self.bond_result_text.insert(tk.END, text)
+        self.bond_result_text.config(state=tk.DISABLED)
+
+    def show_re_result(self, text):
+        self.re_result_text.config(state=tk.NORMAL)
+        self.re_result_text.delete(1.0, tk.END)
+        self.re_result_text.insert(tk.END, text)
+        self.re_result_text.config(state=tk.DISABLED)
+
+    def show_error(self, message):
+        messagebox.showerror("Ошибка", message)
+
+    def setup_help_tab(self):
+        tab = ttk.Frame(self.notebook)
+        self.notebook.add(tab, text="Справка")
+
+        help_text = """
+        Business Valuation Tool - программа для оценки стоимости акций, недвижимости, бизнеса и облигаций.
+
+        Функции:
+        1. Оценка бизнеса/акций/недвижимости по модели DCF
+        2. Расчет доходности облигаций (YTM)
+        3. Расчет стоимости собственного капитала (Re)
+        4. Расчет g FCFE (темп роста свободного денежного потока на капитал)
+
+        Инструкция:
+        - Для оценки бизнеса/акций/недвижимости используйте вкладку "Оценка бизнеса/акций"
+        - Для оценки облигаций используйте вкладку "Оценка облигаций"
+        - Для расчета стоимости собственного капитала используйте вкладку "Расчет Re"
+        - Для расчета g FCFE используйте вкладку "Расчет g FCFE"
+        """
+        ttk.Label(tab, text=help_text, justify=tk.LEFT).pack(padx=10, pady=10)
+
+
+def create_exe():
+    try:
+        try:
+            import PyInstaller
+        except ImportError:
+            print("\nУстановка PyInstaller...")
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "pyinstaller"])
+
+        script_path = Path(__file__).resolve()
+
+        command = [
+            sys.executable,
+            '-m',
+            'PyInstaller',
+            '--onefile',
+            '--windowed',
+            '--name=BusinessValuationTool',
+            str(script_path)
+        ]
+
+        print("\nКоманда для сборки:")
+        print(' '.join(command))
+
+        print("\nНачинаем сборку EXE... (это займет 1-3 минуты)")
+        subprocess.run(command, check=True)
+
+        messagebox.showinfo("Успех", "EXE-файл успешно создан в папке 'dist'")
+    except Exception as e:
+        messagebox.showerror("Ошибка", f"Ошибка при создании EXE-файла: {str(e)}")
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = BusinessValuationApp(root)
+    root.mainloop()
