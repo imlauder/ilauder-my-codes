@@ -1,0 +1,510 @@
+import customtkinter as ctk
+import math
+import sys
+
+# Константа для сравнения с нулем, чтобы избежать ошибок округления
+EPSILON = 1e-9
+
+
+# ====================================================================
+# ФУНКЦИЯ 1: КОМПЕНСАЦИЯ V1=V0 (Раздел 1)
+# ====================================================================
+def calculate_compensating_basket(V0, E0, R0, i_USD, i_EUR, i_RUB, r_USD_prime, r_EUR_prime, r_RUB_prime, base_currency):
+    """
+    Выполняет анализ по ЛОГИКЕ ДВОЙНОЙ КОМПЕНСАЦИИ с ВЫБОРОМ БАЗОВОЙ ВАЛЮТЫ,
+    используя ПЕРЕБРОШЕННУЮ ДОХОДНОСТЬ ОБЛИГАЦИЙ (r_prime).
+    """
+
+    # Расчет Delta
+    # EURUSD: (i_USD - i_EUR) + (r'_USD - r'_EUR)
+    C_Base_EUR = i_USD - i_EUR
+    C_Corr_EUR = r_USD_prime - r_EUR_prime 
+    Delta_EURUSD = C_Base_EUR + C_Corr_EUR
+
+    # USDRUB: (i_RUB - i_USD) + (r'_RUB - r'_USD)
+    C_Base_RUB = i_RUB - i_USD
+    C_Corr_RUB = r_RUB_prime - r_USD_prime
+    Delta_USDRUB = C_Base_RUB + C_Corr_RUB
+
+    # Прогноз ожидаемых курсов (t=1).
+    E1 = E0 * (1 + Delta_EURUSD)
+    R1 = R0 * (1 + Delta_USDRUB)
+
+    # Пересчет для отображения в отчете
+    C_Base_RUB_Report = i_RUB - i_USD
+    C_Corr_RUB_Report = r_RUB_prime - r_USD_prime 
+
+    # --- АДАПТАЦИЯ К БАЗОВОЙ ВАЛЮТЕ И РАСЧЕТ K-КОЭФФИЦИЕНТОВ ---
+    if base_currency == "USD":
+        Base_V0 = V0
+        Base_Label = "USD"
+
+        K_USD = 1.0
+        K_EUR = (E1 / E0)
+        K_RUB = (R0 / R1)
+
+        V0_conv_USD = 1
+        V0_conv_EUR = E0
+        V0_conv_RUB = 1 / R0
+
+    elif base_currency == "EUR":
+        Base_V0 = V0 / E0
+        Base_Label = "EUR"
+
+        K_EUR = 1.0
+        K_USD = E0 / E1
+        K_RUB = (E0 / E1) * (R0 / R1)
+
+        V0_conv_USD = 1 / E0
+        V0_conv_EUR = 1
+        V0_conv_RUB = (1 / R0) / E0
+
+    else:
+        raise ValueError("Неверная базовая валюта.")
+
+    currencies = {
+        "USD": {"K": K_USD, "r": r_USD_prime, "label": "USD", "V0_conv": V0_conv_USD},
+        "EUR": {"K": K_EUR, "r": r_EUR_prime, "label": "EUR", "V0_conv": V0_conv_EUR},
+        "RUB": {"K": K_RUB, "r": r_RUB_prime, "label": "RUB", "V0_conv": V0_conv_RUB}
+    }
+
+    # --- ПОИСК И РАСЧЕТ ЛУЧШЕЙ КОМПЕНСИРУЮЩЕЙ КОРЗИНЫ ---
+
+    basket_result = f"⚠️ Расчет оптимальной корзины (V1={Base_Label} {Base_V0:.2f}) невозможен. Нет компенсирующей пары."
+
+    compensating_pairs = []
+    currency_list = list(currencies.values())
+
+    for i in range(len(currency_list)):
+        for j in range(i + 1, len(currency_list)):
+            c1_data = currency_list[i]
+            c2_data = currency_list[j]
+
+            K1 = c1_data["K"]
+            K2 = c2_data["K"]
+
+            if (K1 - 1) * (K2 - 1) < -EPSILON:
+                if K1 > K2:
+                    X, Y = c1_data, c2_data
+                else:
+                    X, Y = c2_data, c1_data
+
+                k_diff = abs(X["K"] - Y["K"])
+
+                compensating_pairs.append({"X": X, "Y": Y, "K_diff": k_diff})
+
+    if compensating_pairs:
+        best_pair = max(compensating_pairs, key=lambda p: p["K_diff"])
+        best_X = best_pair["X"]
+        best_Y = best_pair["Y"]
+
+        target_K = 1.0
+        K_X = best_X["K"]
+        K_Y = best_Y["K"]
+
+        P = (-(K_Y - target_K)) / ((K_X - target_K))
+
+        V_Y_base = Base_V0 / (P + 1)
+        V_X_base = P * V_Y_base
+
+        Percent_X = (V_X_base / Base_V0) * 100
+        Percent_Y = (V_Y_base / Base_V0) * 100
+
+        y = V_X_base / best_X["V0_conv"]
+        z = V_Y_base / best_Y["V0_conv"]
+
+        V0_check = V_X_base + V_Y_base
+        V1_check = (V_X_base * K_X) + (V_Y_base * K_Y)
+
+        warning = ""
+        if len(compensating_pairs) > 1:
+            all_pairs_str = ", ".join([f"{p['X']['label']}/{p['Y']['label']}" for p in compensating_pairs])
+            warning = f"\nПримечание: Найдено несколько компенсирующих пар ({all_pairs_str}). Выбрана пара с наибольшей разницей K ({best_X['label']}/{best_Y['label']})."
+
+        basket_result = f"""
+Оптимальная пара: **{best_X['label']}** (Рост, K={K_X:.4f}) и **{best_Y['label']}** (Падение, K={K_Y:.4f})
+Разница K (|K_X - K_Y|): {best_pair['K_diff']:.5f}
+--------------------------------------------------
+Оптимальная сумма в {best_X['label']} (y): {y:.2f} {best_X['label']} ({V_X_base:.2f} {Base_Label}, **{Percent_X:.2f}%** от V0)
+Оптимальная сумма в {best_Y['label']} (z): {z:.2f} {best_Y['label']} ({V_Y_base:.2f} {Base_Label}, **{Percent_Y:.2f}%** от V0)
+Коэффициент пропорции (P, V_X_base/V_Y_base): {P:.5f}
+--------------------------------------------------
+Проверка V0 (Начальная стоимость): {V0_check:.2f} {Base_Label}
+Проверка V1 (Конечная стоимость): {V1_check:.2f} {Base_Label}
+{warning}
+"""
+    else:
+        k_values = {k: v['K'] for k, v in currencies.items()}
+        k_min = min(k_values.values())
+        k_max = max(k_values.values())
+
+        if k_max < 1.0 - EPSILON:
+            basket_result = f"⚠️ Расчет оптимальной корзины (V1=V0) невозможен. Все активы падают (K < 1.0). Диапазон K: {k_min * 100:.2f}% - {k_max * 100:.2f}%."
+        elif k_min > 1.0 + EPSILON:
+            basket_result = f"⚠️ Расчет оптимальной корзины (V1=V0) невозможен. Все активы растут (K > 1.0). Диапазон K: {k_min * 100:.2f}% - {k_max * 100:.2f}%."
+        else:
+            basket_result = "⚠️ Расчет оптимальной корзины (V1=V0) невозможен. Нет компенсирующей пары."
+
+    # Формирование отчета для Раздела 1
+    report_stage1_full = f"""
+## 1. ⚖️ КУРСОВАЯ КОМПЕНСАЦИЯ (USD/EUR/RUB, V1=V0)
+*ВНИМАНИЕ: C_Corr рассчитан с использованием ПЕРЕБРОСА ПРЕМИИ RUB*
+Базовая валюта для расчета V1=V0: **{Base_Label}** (V0={Base_V0:.2f} {Base_Label})
+--------------------------------------------------
+1. Разница ставок ЦБ (C_Base):
+C_Base_EUR (i_USD - i_EUR): {C_Base_EUR * 100:.2f}%
+C_Base_RUB (i_RUB - i_USD): {C_Base_RUB_Report * 100:.2f}%
+2. Разница доходности облигаций (C_Corr, с ПЕРЕБРОСКОЙ r'):
+C_Corr_EUR (r'_USD - r'_EUR): {C_Corr_EUR * 100:.2f}%
+C_Corr_RUB (r'_RUB - r'_USD): {C_Corr_RUB * 100:.2f}%
+--------------------------------------------------
+ОБЩЕЕ ИЗМЕНЕНИЕ КУРСА (Delta = C_Base + C_Corr):
+Delta_EURUSD: {Delta_EURUSD * 100:.2f}%
+Delta_USDRUB: {Delta_USDRUB * 100:.2f}%
+--------------------------------------------------
+Коэффициент роста K_USD (Только курс, в {Base_Label}): {K_USD:.4f} ({K_USD * 100 - 100:.2f}%)
+Коэффициент роста K_EUR (Только курс, в {Base_Label}): {K_EUR:.4f} ({K_EUR * 100 - 100:.2f}%)
+Коэффициент роста K_RUB (Только курс, в {Base_Label}): {K_RUB:.4f} ({K_RUB * 100 - 100:.2f}%)
+--------------------------------------------------
+{basket_result}
+"""
+    return report_stage1_full, E1
+
+
+# ====================================================================
+# ФУНКЦИЯ 2: ДВУХЭТАПНЫЙ ПАРИТЕТ (Разделы 2 и 3)
+# ====================================================================
+def calculate_eur_usd_basket(V0_usd, E0, driving_force_usd, driving_force_eur, stage_label, delta_label, E_next_label):
+    """
+    Рассчитывает оптимальную корзину EUR/USD для достижения 50%/50% на основе одной движущей силы.
+    """
+
+    # 1. Определение движущей силы курса (Delta)
+    delta = driving_force_usd - driving_force_eur
+
+    # 2. Расчет ожидаемого курса (E_next)
+    E_next = E0 * (1 + delta)
+
+    # 3. Расчет оптимального соотношения (x - доля USD в V0)
+    # x = 1 - 0.5 * (E0 / E_next)
+    x = 1 - 0.5 * (E0 / E_next)
+
+    # 4. Расчет сумм и процентов
+    if x < -EPSILON or x > 1 + EPSILON:
+        is_possible = False
+        x = max(0, min(1, x))  # Для отображения процентов в отчете
+    else:
+        is_possible = True
+
+    # Суммы V0 в USD
+    V0_USD = x * V0_usd
+    V0_EUR_in_USD = (1 - x) * V0_usd
+
+    # Сумма в нативных EUR
+    y_EUR = V0_EUR_in_USD / E0
+
+    # Суммы V1
+    V1_USD = V0_USD * 1.0
+    V1_EUR_in_USD = V0_EUR_in_USD * (E_next / E0)
+    V1_Total = V1_USD + V1_EUR_in_USD
+
+    # 5. Форматирование отчета
+    if is_possible:
+        basket_report = f"""
+Оптимальное начальное распределение (V0) для достижения V1_USD=V1_EUR:
+* **USD:** {V0_USD:.2f} USD (**{x * 100:.2f}%** от V0)
+* **EUR:** {y_EUR:.2f} EUR ({V0_EUR_in_USD:.2f} USD, **{(1 - x) * 100:.2f}%** от V0)
+
+Проверка V1 (Конечная стоимость):
+* **V1_Total (в USD):** {V1_Total:.2f} USD
+* **V1_USD:** {V1_USD:.2f} USD ({V1_USD / V1_Total * 100:.2f}%)
+* **V1_EUR:** {V1_EUR_in_USD:.2f} USD ({V1_EUR_in_USD / V1_Total * 100:.2f}%)
+"""
+    else:
+        basket_report = f"""
+⚠️ Невозможно достичь целевого соотношения 50% EUR / 50% USD, используя только эти две валюты.
+Требуемая доля USD ({x * 100:.2f}%) выходит за пределы диапазона [0%, 100%].
+"""
+
+    report = f"""
+## {stage_label}
+* **Начальный курс EURUSD (E0):** {E0:.5f}
+* **{delta_label}:** {delta * 100:.2f}%
+* **{E_next_label}:** {E_next:.5f}
+* **Цель:** Достичь 50% USD / 50% EUR при целевом курсе.
+---
+{basket_report}
+"""
+    return report, E_next
+
+
+# ====================================================================
+# ОСНОВНОЙ КЛАСС И ЛОГИКА
+# ====================================================================
+class CurrencyCalculatorApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+
+        # Настройки окна
+        self.title("Калькулятор Валютной Корзины (Полный Анализ)")
+        self.geometry("900x950")
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(4, weight=1)
+
+        # --- ФРЕЙМЫ ДЛЯ ВВОДА ---
+        self.input_frame = ctk.CTkFrame(self)
+        self.input_frame.grid(row=0, column=0, padx=20, pady=(20, 10), sticky="ew")
+        self.input_frame.grid_columnconfigure((0, 1, 2, 3, 4, 5, 6, 7), weight=1)
+
+        self.entries = {}
+
+        # --- БЛОК 1: Основные параметры ---
+        self.create_input_block(
+            frame=self.input_frame,
+            title="Исходные параметры",
+            row_start=0,
+            col_start=0,
+            values={
+                "V0 (Капитал, USD)": "300.0",
+                "E0 (EURUSD, t=0)": "1.16220",
+                "R0 (USDRUB, t=0)": "81.12",
+            }
+        )
+
+        # --- БЛОК 2: Ставки ЦБ (i) ---
+        self.create_input_block(
+            frame=self.input_frame,
+            title="Ставки ЦБ (i, %)",
+            row_start=0,
+            col_start=3,
+            values={
+                "i_USD (%)": "4.00",
+                "i_EUR (%)": "2.15",
+                "i_RUB (%)": "16.50",
+            }
+        )
+
+        # --- БЛОК 3: Премии за риск (p) ---
+        self.bond_frame = ctk.CTkFrame(self)
+        self.bond_frame.grid(row=1, column=0, padx=20, pady=10, sticky="ew")
+        self.bond_frame.grid_columnconfigure((0, 1, 2, 3, 4, 5, 6, 7, 8, 9), weight=1)
+
+        self.create_input_block(
+            frame=self.bond_frame,
+            title="Премии за риск (p, %)",
+            row_start=0,
+            col_start=0,
+            values={
+                "p_USD (%)": "2.00",
+                "p_EUR (%)": "2.55",
+                "p_RUB (%)": "3.50",
+            },
+            single_row=True
+        )
+
+        # --- БЛОК 4: Выбор Базовой Валюты для Раздела 1 (влияет на r_RUB!) ---
+        self.base_label = ctk.CTkLabel(self.bond_frame, text="База для Р.1:", font=ctk.CTkFont(weight="bold"))
+        self.base_label.grid(row=0, column=7, padx=10, pady=5, sticky="w")
+        self.base_currency_var = ctk.StringVar(value="USD")  # Установка USD по умолчанию
+        self.base_currency_option = ctk.CTkOptionMenu(self.bond_frame,
+                                                      values=["USD", "EUR"],
+                                                      variable=self.base_currency_var,
+                                                      width=80)
+        self.base_currency_option.grid(row=0, column=8, padx=(0, 10), pady=5, sticky="e")
+
+        # Кнопка расчета
+        self.calculate_button = ctk.CTkButton(self, text="РАССЧИТАТЬ ПОЛНЫЙ АНАЛИЗ", command=self.run_calculation)
+        self.calculate_button.grid(row=2, column=0, padx=20, pady=10, sticky="ew")
+
+        # Текстовое поле для результатов
+        ctk.CTkLabel(self, text="Полный отчет:").grid(row=3, column=0, padx=20, pady=(10, 0), sticky="nw")
+        self.result_text = ctk.CTkTextbox(self, height=600, font=ctk.CTkFont(family="Consolas", size=14))
+        self.result_text.grid(row=4, column=0, padx=20, pady=(0, 20), sticky="nsew")
+
+        # Вставка начального пояснения
+        self.insert_initial_explanation()
+
+    def insert_initial_explanation(self):
+        """Вставляет короткое пояснение о работе программы."""
+        initial_explanation = """
+==================================================
+             КАЛЬКУЛЯТОР ВАЛЮТНОЙ КОРЗИНЫ
+==================================================
+*** ПОЛНЫЙ АНАЛИЗ (3 РАЗДЕЛА) ***
+
+**Раздел 1 (Курсовая компенсация V1=V0):**
+    - Доходность r' рассчитывается с ПЕРЕБРОСОМ ПРЕМИИ RUB.
+
+**Раздел 3 (Паритет Доходностей):**
+    - Доходность r_R3 рассчитывается с ПЕРЕКРЕСТНЫМ ПЕРЕБРОСОМ ПРЕМИЙ EUR/USD.
+
+Введите параметры и нажмите 'РАССЧИТАТЬ'.
+"""
+        self.result_text.delete("1.0", ctk.END)
+        self.result_text.insert("1.0", initial_explanation)
+
+    def create_input_block(self, frame, title, row_start, col_start, values, single_row=False):
+        """Создает блок заголовка и полей ввода."""
+        ctk.CTkLabel(frame, text=title, font=ctk.CTkFont(weight="bold")).grid(
+            row=row_start, column=col_start, columnspan=2, padx=10, pady=(10, 5), sticky="w"
+        )
+        current_row = row_start + 1
+        current_col = col_start
+
+        for label, default_value in values.items():
+            ctk.CTkLabel(frame, text=label).grid(row=current_row, column=current_col, padx=(10, 0), pady=5, sticky="w")
+
+            entry = ctk.CTkEntry(frame, width=80)
+            entry.insert(0, default_value)
+            entry.grid(row=current_row, column=current_col + 1, padx=(0, 10), pady=5, sticky="e")
+            self.entries[label] = entry
+
+            if single_row:
+                current_col += 2
+            else:
+                current_row += 1
+
+    def run_calculation(self):
+        """Считывает данные, запускает логику расчета и отображает результат."""
+        try:
+            # 1. Сбор данных из полей ввода
+            data = {}
+            for label, entry in self.entries.items():
+                data[label] = float(entry.get().replace(',', '.'))
+
+            base_currency = self.base_currency_var.get()
+
+            # 2. Конвертация процентов в десятичный формат для удобства
+            i_USD = data["i_USD (%)"] / 100
+            i_EUR = data["i_EUR (%)"] / 100
+            i_RUB = data["i_RUB (%)"] / 100
+            
+            p_USD = data["p_USD (%)"] / 100
+            p_EUR = data["p_EUR (%)"] / 100
+            p_RUB = data["p_RUB (%)"] / 100
+            
+            # 3. ВЫЧИСЛЕНИЕ СКОРРЕКТИРОВАННЫХ ДОХОДНОСТЕЙ
+            
+            # 3.1. r' (Для Раздела 1 - Курсовая компенсация - с ПЕРЕБРОСОМ RUB)
+            # r'_USD = i_USD + p_RUB
+            # r'_EUR = i_EUR + p_RUB
+            # r'_RUB = i_RUB + p_USD (если база USD) ИЛИ r'_RUB = i_RUB + p_EUR (если база EUR)
+
+            r_USD_prime = i_USD + p_RUB
+            r_EUR_prime = i_EUR + p_RUB
+            
+            if base_currency == "USD":
+                r_RUB_prime = i_RUB + p_USD
+            elif base_currency == "EUR":
+                r_RUB_prime = i_RUB + p_EUR
+            else:
+                r_RUB_prime = i_RUB + p_USD
+                
+            # 3.2. r_R3 (Для Раздела 3 - Паритет Доходностей - с ПЕРЕКРЕСТНЫМ ПЕРЕБРОСОМ EUR/USD)
+            # r_USD_R3 = i_USD + p_EUR
+            # r_EUR_R3 = i_EUR + p_USD
+            
+            r_USD_R3 = i_USD + p_EUR
+            r_EUR_R3 = i_EUR + p_USD
+
+            # 3.3. Проверка: r >= i (что премия >= 0)
+            corrections = []
+            
+            # Проверки для r' (Раздел 1)
+            if r_USD_prime < i_USD: 
+                r_USD_prime = i_USD
+                corrections.append(f"r'_USD (был {r_USD_prime * 100:.2f}%) скорректирован до i_USD ({i_USD * 100:.2f}%)")
+            if r_EUR_prime < i_EUR:
+                r_EUR_prime = i_EUR
+                corrections.append(f"r'_EUR (был {r_EUR_prime * 100:.2f}%) скорректирован до i_EUR ({i_EUR * 100:.2f}%)")
+            if r_RUB_prime < i_RUB:
+                r_RUB_prime = i_RUB
+                corrections.append(f"r'_RUB (был {r_RUB_prime * 100:.2f}%) скорректирован до i_RUB ({i_RUB * 100:.2f}%)")
+                
+            # Проверки для r_R3 (Раздел 3)
+            if r_USD_R3 < i_USD:
+                r_USD_R3 = i_USD
+                corrections.append(f"r_USD_R3 (был {r_USD_R3 * 100:.2f}%) скорректирован до i_USD ({i_USD * 100:.2f}%)")
+            if r_EUR_R3 < i_EUR:
+                r_EUR_R3 = i_EUR
+                corrections.append(f"r_EUR_R3 (был {r_EUR_R3 * 100:.2f}%) скорректирован до i_EUR ({i_EUR * 100:.2f}%)")
+
+            correction_note = ""
+            if corrections:
+                correction_note = "\n!!! ПРАВИЛО КОРРЕКЦИИ ДОХОДНОСТИ ПРИМЕНЕНО (r < i) !!!\n" + "\n".join(
+                    corrections) + "\n--------------------------------------------------\n"
+
+            V0 = data["V0 (Капитал, USD)"]
+            E0 = data["E0 (EURUSD, t=0)"]
+            R0 = data["R0 (USDRUB, t=0)"]
+
+            # ====================================================================
+            # РАЗДЕЛ 1: Курсовая компенсация (V1=V0)
+            # Передаем r' (с перебросом RUB)
+            # ====================================================================
+            report_R1, E1_from_R1 = calculate_compensating_basket(
+                V0, E0, R0, i_USD, i_EUR, i_RUB, r_USD_prime, r_EUR_prime, r_RUB_prime, base_currency
+            )
+
+            # ====================================================================
+            # РАЗДЕЛ 2: Паритет Ставок ЦБ (Цель 50/50)
+            # Использует i_USD, i_EUR
+            # ====================================================================
+            report_R2, E1_from_R2 = calculate_eur_usd_basket(
+                V0, E0, i_USD, i_EUR,
+                "2. 💰 РАСЧЕТ ОПТИМАЛЬНОЙ КОРЗИНЫ (ЭТАП 1: ПАРИТЕТ СТАВОК ЦБ)",
+                "Разница ставок ЦБ (i_USD - i_EUR)",
+                "Ожидаемый курс EURUSD (E1)"
+            )
+
+            # ====================================================================
+            # РАЗДЕЛ 3: Паритет Доходностей Облигаций (Цель 50/50)
+            # Передаем r_R3 (с ПЕРЕКРЕСТНЫМ перебросом EUR/USD)
+            # ====================================================================
+            report_R3, _ = calculate_eur_usd_basket(
+                V0, E1_from_R2, r_USD_R3, r_EUR_R3,
+                "3. 📈 РАСЧЕТ ОПТИМАЛЬНОЙ КОРЗИНЫ (ЭТАП 2: ПАРИТЕТ ДОХОДНОСТЕЙ ОБЛИГАЦИЙ)",
+                "Разница доходностей облигаций (r_USD - r_EUR) с перекрестным перебросом",
+                "Ожидаемый-ожидаемый курс EURUSD (E1.1)"
+            )
+
+            # 4. Отображение результата
+            final_report = f"""
+==================================================
+             ОТЧЕТ АНАЛИЗА ВАЛЮТНЫХ КОРЗИН
+==================================================
+Введенные премии (p): p_USD={p_USD*100:.2f}%, p_EUR={p_EUR*100:.2f}%, p_RUB={p_RUB*100:.2f}%
+--------------------------------------------------
+Вычисленные доходности (Раздел 1 - r', переброс RUB): 
+r'_USD={r_USD_prime*100:.2f}%, r'_EUR={r_EUR_prime*100:.2f}%, r'_RUB={r_RUB_prime*100:.2f}%
+Вычисленные доходности (Раздел 3 - r_R3, перекрестный переброс EUR/USD):
+r_USD_R3={r_USD_R3*100:.2f}%, r_EUR_R3={r_EUR_R3*100:.2f}%
+--------------------------------------------------
+{correction_note}
+{report_R1}
+---
+{report_R2}
+---
+{report_R3}
+"""
+            self.result_text.delete("1.0", ctk.END)
+            self.result_text.insert("1.0", final_report)
+
+        except ValueError:
+            self.result_text.delete("1.0", ctk.END)
+            self.result_text.insert("1.0",
+                                    "Ошибка ввода: Проверьте, что все поля содержат корректные числа (используйте точку как десятичный разделитель).")
+        except Exception as e:
+            self.result_text.delete("1.0", ctk.END)
+            self.result_text.insert("1.0", f"Произошла непредвиденная ошибка: {e}")
+
+
+if __name__ == "__main__":
+    try:
+        app = CurrencyCalculatorApp()
+        app.mainloop()
+    except ImportError:
+        print("Ошибка: Библиотека 'customtkinter' не найдена.")
+        print("Пожалуйста, установите ее, выполнив: pip install customtkinter")
+    except Exception as e:
+        print(f"При запуске приложения возникла ошибка: {e}")
