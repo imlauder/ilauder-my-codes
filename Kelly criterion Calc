@@ -1,0 +1,476 @@
+import tkinter as tk
+from tkinter import ttk, messagebox
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import numpy as np
+import math
+import random
+from collections import Counter
+import statistics
+import sys
+import os
+
+
+class KellyApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Анализ ставок")
+        self.root.geometry("1200x800")
+        self.style = ttk.Style()
+        self.style.configure('TFrame', background='#f0f0f0')
+        self.style.configure('TLabel', background='#f0f0f0', font=('Arial', 10))
+        self.style.configure('TButton', font=('Arial', 10))
+        self.style.configure('TNotebook.Tab', font=('Arial', 10, 'bold'))
+
+        self.create_widgets()
+
+    def create_widgets(self):
+        self.main_frame = ttk.Frame(self.root)
+        self.main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        self.notebook = ttk.Notebook(self.main_frame)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
+
+        self.kelly_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.kelly_frame, text="Критерий Келли")
+        self.create_kelly_tab()
+
+        self.prob_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.prob_frame, text="Расчет вероятности")
+        self.create_prob_tab()
+
+        self.margin_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.margin_frame, text="Калькулятор маржи")
+        self.create_margin_tab()
+
+    def create_kelly_tab(self):
+        input_frame = ttk.LabelFrame(self.kelly_frame, text="Параметры ставки", padding=(10, 5))
+        input_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        self.kelly_input_choice = tk.StringVar(value="coefficient")
+
+        self.radio_coef = ttk.Radiobutton(input_frame, text="Коэффициент чистого выигрыша:",
+                                          variable=self.kelly_input_choice, value="coefficient",
+                                          command=self.toggle_kelly_input)
+        self.radio_coef.grid(row=0, column=0, sticky=tk.W, pady=2)
+        self.win_coef = ttk.Entry(input_frame, width=10)
+        self.win_coef.grid(row=0, column=1, sticky=tk.W, pady=2)
+        self.win_coef.insert(0, "2.0")
+
+        self.radio_prob = ttk.Radiobutton(input_frame, text="Вероятность чистого выигрыша (%):",
+                                          variable=self.kelly_input_choice, value="probability",
+                                          command=self.toggle_kelly_input)
+        self.radio_prob.grid(row=1, column=0, sticky=tk.W, pady=2)
+        self.win_prob_entry = ttk.Entry(input_frame, width=10, state=tk.DISABLED)
+        self.win_prob_entry.grid(row=1, column=1, sticky=tk.W, pady=2)
+        self.win_prob_entry.insert(0, "50")
+
+        self.return_var = tk.BooleanVar()
+        self.return_check = ttk.Checkbutton(input_frame, text="Возврат ставки", variable=self.return_var,
+                                            command=self.toggle_return)
+        self.return_check.grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=2)
+
+        ttk.Label(input_frame, text="Коэффициент возврата:").grid(row=3, column=0, sticky=tk.W, pady=2)
+        self.return_coef = ttk.Entry(input_frame, width=10, state=tk.DISABLED)
+        self.return_coef.grid(row=3, column=1, sticky=tk.W, pady=2)
+        self.return_coef.insert(0, "1.0")
+
+        # Изменения здесь: добавлен текст "(коэффициент выплаты)"
+        ttk.Label(input_frame, text="Букмекерский коэффициент (коэффициент выплаты):").grid(row=4, column=0, sticky=tk.W, pady=2)
+        self.bookmaker_coef = ttk.Entry(input_frame, width=10)
+        self.bookmaker_coef.grid(row=4, column=1, sticky=tk.W, pady=2)
+        self.bookmaker_coef.insert(0, "1.91")
+
+        # Добавлено: Фрейм для ввода капитала
+        capital_frame = ttk.LabelFrame(input_frame, text="Ввод капитала", padding=(5, 2))
+        capital_frame.grid(row=5, column=0, columnspan=2, sticky=tk.W + tk.E, pady=5)
+        capital_frame.grid_columnconfigure(1, weight=1) # Чтобы Entry растягивался
+
+        self.capital_var = tk.BooleanVar()
+        self.capital_check = ttk.Checkbutton(capital_frame, text="Ввести капитал", variable=self.capital_var,
+                                             command=self.toggle_capital_entry)
+        self.capital_check.grid(row=0, column=0, sticky=tk.W, pady=2)
+
+        self.capital_entry = ttk.Entry(capital_frame, width=10, state=tk.DISABLED)
+        self.capital_entry.grid(row=0, column=1, sticky=tk.W + tk.E, padx=5, pady=2)
+        self.capital_entry.insert(0, "1000") # Пример значения капитала
+
+        calc_btn = ttk.Button(input_frame, text="Рассчитать", command=self.calculate_kelly)
+        calc_btn.grid(row=6, column=0, columnspan=2, pady=10) # Строка изменена
+
+        result_frame = ttk.LabelFrame(self.kelly_frame, text="Результаты", padding=(10, 5))
+        result_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        self.result_text = tk.Text(result_frame, height=10, wrap=tk.WORD)
+        self.result_text.pack(fill=tk.BOTH, expand=True)
+
+        self.graph_frame = ttk.Frame(result_frame)
+        self.graph_frame.pack(fill=tk.BOTH, expand=True, pady=10)
+
+    def toggle_capital_entry(self):
+        if self.capital_var.get():
+            self.capital_entry.config(state=tk.NORMAL)
+        else:
+            self.capital_entry.config(state=tk.DISABLED)
+
+    def toggle_kelly_input(self):
+        choice = self.kelly_input_choice.get()
+        if choice == "coefficient":
+            self.win_coef.config(state=tk.NORMAL)
+            self.win_prob_entry.config(state=tk.DISABLED)
+        else: # choice == "probability"
+            self.win_coef.config(state=tk.DISABLED)
+            self.win_prob_entry.config(state=tk.NORMAL)
+
+    def toggle_return(self):
+        if self.return_var.get():
+            self.return_coef.config(state=tk.NORMAL)
+        else:
+            self.return_coef.config(state=tk.DISABLED)
+
+    def create_prob_tab(self):
+        input_frame = ttk.LabelFrame(self.prob_frame, text="Параметры", padding=(10, 5))
+        input_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        ttk.Label(input_frame, text="Количество исходов:").grid(row=0, column=0, sticky=tk.W, pady=2)
+        self.num_outcomes = ttk.Combobox(input_frame, values=[2, 3, 4, 5], width=5)
+        self.num_outcomes.grid(row=0, column=1, sticky=tk.W, pady=2)
+        self.num_outcomes.set(2)
+
+        ttk.Label(input_frame, text="Количество букмекеров:").grid(row=1, column=0, sticky=tk.W, pady=2)
+        self.num_bookmakers = ttk.Combobox(input_frame, values=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10], width=5)
+        self.num_bookmakers.grid(row=1, column=1, sticky=tk.W, pady=2)
+        self.num_bookmakers.set(3)
+
+        create_btn = ttk.Button(input_frame, text="Создать таблицу", command=self.create_odds_table)
+        create_btn.grid(row=2, column=0, columnspan=2, pady=10)
+
+        self.odds_frame = ttk.Frame(self.prob_frame)
+        self.odds_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        calc_btn = ttk.Button(self.prob_frame, text="Рассчитать вероятности", command=self.calculate_probabilities)
+        calc_btn.pack(pady=5)
+
+        self.prob_result_frame = ttk.LabelFrame(self.prob_frame, text="Результаты", padding=(10, 5))
+        self.prob_result_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        self.prob_result_text = tk.Text(self.prob_result_frame, height=10, wrap=tk.WORD)
+        self.prob_result_text.pack(fill=tk.BOTH, expand=True)
+
+    def create_margin_tab(self):
+        input_frame = ttk.LabelFrame(self.margin_frame, text="Ввод данных", padding=(10, 5))
+        input_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        ttk.Label(input_frame, text="Коэффициент на исход 1:").grid(row=0, column=0, sticky=tk.W, pady=2)
+        self.odds1 = ttk.Entry(input_frame, width=10)
+        self.odds1.grid(row=0, column=1, sticky=tk.W, pady=2)
+        self.odds1.insert(0, "1.80")
+
+        ttk.Label(input_frame, text="Маржа букмекера (%):").grid(row=1, column=0, sticky=tk.W, pady=2)
+        self.margin = ttk.Entry(input_frame, width=10)
+        self.margin.grid(row=1, column=1, sticky=tk.W, pady=2)
+        self.margin.insert(0, "5.0")
+
+        calc_btn = ttk.Button(input_frame, text="Рассчитать", command=self.calculate_margin)
+        calc_btn.grid(row=2, column=0, columnspan=2, pady=10)
+
+        result_frame = ttk.LabelFrame(self.margin_frame, text="Результаты", padding=(10, 5))
+        result_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        self.margin_result_text = tk.Text(result_frame, height=10, wrap=tk.WORD)
+        self.margin_result_text.pack(fill=tk.BOTH, expand=True)
+
+    def calculate_margin(self):
+        try:
+            odds1 = float(self.odds1.get())
+            margin = float(self.margin.get()) / 100
+
+            prob1 = 1 / odds1
+            prob2 = 1 - prob1 - margin
+            odds2 = 1 / prob2 if prob2 > 0 else float('inf')
+
+            self.margin_result_text.delete(1.0, tk.END)
+            self.margin_result_text.insert(tk.END, "=== Результаты расчета ===\n\n")
+            self.margin_result_text.insert(tk.END, f"Коэффициент на исход 1: {odds1:.2f}\n")
+            self.margin_result_text.insert(tk.END, f"Подразумеваемая вероятность: {prob1:.2%}\n\n")
+            self.margin_result_text.insert(tk.END, f"Коэффициент на исход 2: {odds2:.2f}\n")
+            self.margin_result_text.insert(tk.END, f"Подразумеваемая вероятность: {prob2:.2%}\n\n")
+            self.margin_result_text.insert(tk.END, f"Сумма вероятностей: {(prob1 + prob2):.2%}\n")
+            self.margin_result_text.insert(tk.END, f"Маржа букмекера: {margin:.2%}\n")
+
+        except ValueError:
+            messagebox.showerror("Ошибка", "Пожалуйста, введите корректные числовые значения")
+        except ZeroDivisionError:
+            messagebox.showerror("Ошибка", "Невозможно рассчитать коэффициент (вероятность <= 0)")
+
+    def create_odds_table(self):
+        for widget in self.odds_frame.winfo_children():
+            widget.destroy()
+
+        try:
+            num_outcomes = int(self.num_outcomes.get())
+            num_bookmakers = int(self.num_bookmakers.get())
+        except ValueError:
+            messagebox.showerror("Ошибка", "Введите корректные числа")
+            return
+
+        self.odds_entries = []
+
+        for j in range(num_outcomes):
+            ttk.Label(self.odds_frame, text=f"Исход {j + 1}").grid(row=0, column=j + 1, padx=5, pady=2)
+
+        for i in range(num_bookmakers):
+            ttk.Label(self.odds_frame, text=f"БК {i + 1}").grid(row=i + 1, column=0, padx=5, pady=2)
+            row_entries = []
+            for j in range(num_outcomes):
+                entry = ttk.Entry(self.odds_frame, width=8)
+                entry.grid(row=i + 1, column=j + 1, padx=5, pady=2)
+                entry.insert(0, "1.5")
+                row_entries.append(entry)
+            self.odds_entries.append(row_entries)
+
+    def calculate_probabilities(self):
+        try:
+            num_outcomes = int(self.num_outcomes.get())
+            num_bookmakers = int(self.num_bookmakers.get())
+
+            all_odds = []
+            for j in range(num_outcomes):
+                outcome_odds = []
+                for i in range(num_bookmakers):
+                    try:
+                        odd = float(self.odds_entries[i][j].get())
+                        outcome_odds.append(odd)
+                    except ValueError:
+                        messagebox.showerror("Ошибка", f"Некорректный коэффициент у БК {i + 1}, исход {j + 1}")
+                        return
+                all_odds.append(outcome_odds)
+
+            best_odds = []
+            for odds in all_odds:
+                filtered = self.remove_outliers(odds)
+                best_odds.append(max(filtered) if filtered else 1.0)
+
+            implied_probs = [1.0 / odd for odd in best_odds]
+            total_implied = sum(implied_probs)
+            if total_implied == 0:
+                messagebox.showerror("Ошибка", "Сумма подразумеваемых вероятностей равна нулю. Проверьте коэффициенты.")
+                return
+
+            true_probs = [round((prob / total_implied) * 100, 2) for prob in implied_probs]
+            true_odds = [round(1.0 / (prob / 100.0), 3) if prob != 0 else float('inf') for prob in true_probs]
+
+            self.prob_result_text.delete(1.0, tk.END)
+            self.prob_result_text.insert(tk.END, "Результаты:\n\n")
+
+            for i in range(num_outcomes):
+                self.prob_result_text.insert(tk.END,
+                                              f"Исход {i + 1}: Вероятность = {true_probs[i]}%, Коэффициент = {true_odds[i]}\n")
+
+            if abs(sum(true_probs) - 100.0) > 0.01:
+                self.prob_result_text.insert(tk.END,
+                                              "\n⚠️ Внимание: вероятности не суммируются точно в 100%. Это может быть из-за округления или маржи.")
+
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Произошла ошибка: {str(e)}")
+
+    def remove_outliers(self, odds):
+        if len(odds) < 3:
+            return odds
+        q1 = np.percentile(odds, 25)
+        q3 = np.percentile(odds, 75)
+        iqr = q3 - q1
+        lower_bound = q1 - 1.5 * iqr
+        upper_bound = q3 + 1.5 * iqr
+        return [x for x in odds if lower_bound <= x <= upper_bound]
+
+    def calculate_kelly(self):
+        try:
+            if self.kelly_input_choice.get() == "coefficient":
+                true_win_coef = float(self.win_coef.get())
+                if true_win_coef <= 1:
+                    messagebox.showerror("Ошибка", "Коэффициент чистого выигрыша должен быть больше 1.")
+                    return
+                true_win_prob = 1 / true_win_coef
+            else: # choice == "probability"
+                win_prob_percent = float(self.win_prob_entry.get())
+                if not (1 <= win_prob_percent <= 99):
+                    messagebox.showerror("Ошибка", "Вероятность чистого выигрыша должна быть от 1% до 99%.")
+                    return
+                true_win_prob = win_prob_percent / 100.0
+                true_win_coef = 1 / true_win_prob
+
+            has_return = self.return_var.get()
+            p_return = 0.0
+
+            if has_return:
+                return_coef = float(self.return_coef.get())
+                if return_coef <= 1:
+                    messagebox.showerror("Ошибка", "Коэффициент возврата должен быть больше 1.")
+                    return
+                return_prob = 1 / return_coef
+                p_return = return_prob - true_win_prob
+                if p_return < 0:
+                    messagebox.showerror("Ошибка",
+                                         "Вероятность возврата не может быть отрицательной (проверьте соотношение коэффициентов выигрыша и возврата).")
+                    return
+
+            p_loss = 1 - true_win_prob - p_return
+            if p_loss < 0:
+                messagebox.showerror("Ошибка", "Сумма вероятностей выигрыша и возврата превышает 100%. Проверьте ввод.")
+                return
+
+            bookmaker_coef = float(self.bookmaker_coef.get())
+            if bookmaker_coef <= 1:
+                messagebox.showerror("Ошибка", "Букмекерский коэффициент должен быть больше 1.")
+                return
+
+            bookmaker_prob = 1 / bookmaker_coef
+
+            g = bookmaker_coef - 1
+            l = 1
+
+            kelly_fraction_unconstrained = true_win_prob - p_loss / g
+
+            f = max(0, min(1, kelly_fraction_unconstrained))
+
+            expected_capital_growth_percent = (true_win_prob * (f * g)) + (p_return * (f * 0)) - (p_loss * (f * l))
+
+            n = 10000
+            optimal_results = self.simulate_trades(f, n, true_win_prob, p_return, p_loss, g, l)
+            optimal_growth = self.safe_geo_mean(optimal_results)
+
+            self.result_text.delete(1.0, tk.END)
+            self.result_text.insert(tk.END, "=== Результаты ===\n\n")
+            self.result_text.insert(tk.END, f"Вероятности:\n")
+            self.result_text.insert(tk.END, f" Истинная вероятность выигрыша: {true_win_prob:.2%}\n")
+            self.result_text.insert(tk.END, f" Истинная вероятность возврата: {p_return:.2%}\n")
+            self.result_text.insert(tk.END, f" Истинная вероятность проигрыша: {p_loss:.2%}\n\n")
+
+            self.result_text.insert(tk.END, f"Букмекерские условия:\n")
+            self.result_text.insert(tk.END, f" Коэффициент: {bookmaker_coef:.2f}\n")
+            self.result_text.insert(tk.END, f" Подразумеваемая вероятность букмекера: {bookmaker_prob:.2%}\n")
+            self.result_text.insert(tk.END, f" Потенциальный чистый выигрыш (за ед. ставки): {g:.2f}x\n")
+            self.result_text.insert(tk.END, f" Потенциальный проигрыш (за ед. ставки): {l:.0f}x\n\n")
+
+            self.result_text.insert(tk.END, f"Оптимальная доля по Келли: {f:.2%}\n")
+
+            # Добавляем расчет и вывод оптимального размера ставки в деньгах
+            if self.capital_var.get():
+                try:
+                    capital = float(self.capital_entry.get())
+                    if capital <= 0:
+                        messagebox.showerror("Ошибка", "Размер капитала должен быть положительным числом.")
+                        return
+                    optimal_bet_amount = capital * f
+                    self.result_text.insert(tk.END, f"Оптимальный размер ставки: {optimal_bet_amount:.2f}\n\n")
+                except ValueError:
+                    messagebox.showerror("Ошибка", "Пожалуйста, введите корректное числовое значение для капитала.")
+                    return
+
+            self.result_text.insert(tk.END,
+                                     f"Средняя геометрическая доходность (темп роста на дистанции): {optimal_growth:.4%}\n")
+            self.result_text.insert(tk.END,
+                                     f"Ожидаемый процентный прирост капитала (за одну операцию): {expected_capital_growth_percent:.4%}\n\n")
+
+            if kelly_fraction_unconstrained > 1:
+                self.result_text.insert(tk.END,
+                                         "Внимание: оптимальная доля Келли превышает 100% (крайне рискованно!)\n")
+            elif kelly_fraction_unconstrained < 0:
+                self.result_text.insert(tk.END,
+                                         "Внимание: оптимальная доля Келли отрицательна - ставка невыгодна (EV < 0)\n")
+            else:
+                self.result_text.insert(tk.END, f"Рекомендуемая доля капитала для ставки: {f:.2%}\n")
+
+
+            self.plot_kelly(kelly_fraction_unconstrained, f, optimal_growth, true_win_prob, p_return, p_loss, g, l)
+
+        except ValueError:
+            messagebox.showerror("Ошибка", "Пожалуйста, введите корректные числовые значения")
+        except ZeroDivisionError:
+            messagebox.showerror("Ошибка", "Деление на ноль: проверьте коэффициенты, они не могут быть нулевыми.")
+        except Exception as e:
+            messagebox.showerror("Неизвестная ошибка", f"Произошла непредвиденная ошибка: {str(e)}")
+
+    def simulate_trades(self, f_value, n, win_prob, return_prob, loss_prob, g, l):
+        n_win = round(n * win_prob)
+        n_return = round(n * return_prob)
+        n_loss = n - n_win - n_return
+
+        results = []
+        results.extend([g * f_value] * n_win)
+        results.extend([0] * n_return)
+        results.extend([-l * f_value] * n_loss)
+
+        random.shuffle(results)
+        return results
+
+    def safe_geo_mean(self, returns):
+        product = 1
+        count = 0
+        for r in returns:
+            if 1 + r > 0:
+                product *= (1 + r)
+                count += 1
+            else:
+                return float('-inf')
+
+        if count == 0:
+            return float('-inf')
+
+        if product <= 0:
+            return float('-inf')
+
+        return math.pow(product, 1 / count) - 1
+
+    def plot_kelly(self, f_unconstrained, f, optimal_growth, true_win_prob, p_return, p_loss, g, l):
+        for widget in self.graph_frame.winfo_children():
+            widget.destroy()
+
+        max_f_plot = min(2, 4 * max(0.01, f_unconstrained))
+        if max_f_plot == 0:
+            max_f_plot = 0.1
+
+        f_values = np.linspace(0, max_f_plot, 100)
+        growth_rates = []
+
+        for f_val in f_values:
+            if f_val * l >= 1:
+                growth_rates.append(float('-inf'))
+                continue
+
+            results = self.simulate_trades(f_val, 1000, true_win_prob, p_return, p_loss, g, l)
+            growth = self.safe_geo_mean(results)
+            growth_rates.append(growth)
+
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.plot(f_values, growth_rates, 'b-', label='Средняя геом. доходность')
+
+        if f > 0:
+            ax.axvline(x=f, color='r', linestyle='--', label=f'Оптимальная доля Келли ({f:.2%})')
+
+        ax.axhline(y=0, color='k', linestyle='-', linewidth=0.5)
+        ax.set_xlabel('Доля капитала')
+        ax.set_ylabel('Средняя геометрическая доходность')
+        ax.set_title('Зависимость доходности от размера ставки')
+        ax.legend()
+        ax.grid(True)
+
+        ax.set_ylim(bottom=0)
+
+        if f > 0 and optimal_growth != float('-inf'):
+            ax.annotate(f'Максимум: {optimal_growth:.2%}',
+                        xy=(f, optimal_growth),
+                        xytext=(f + 0.05, optimal_growth - 0.05),
+                        arrowprops=dict(facecolor='black', shrink=0.05))
+
+        canvas = FigureCanvasTkAgg(fig, master=self.graph_frame)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        plt.close(fig)
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = KellyApp(root)
+    root.mainloop()
