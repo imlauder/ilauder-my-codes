@@ -1,0 +1,660 @@
+import os
+import numpy as np
+import plotly.graph_objects as go
+from scipy.optimize import curve_fit
+from scipy.stats import norm
+import warnings
+from dash import Dash, dcc, html, Input, Output, State, no_update, callback_context
+import dash_bootstrap_components as dbc
+import webbrowser
+from threading import Timer
+from scipy.signal import savgol_filter
+
+warnings.filterwarnings("ignore", category=UserWarning)
+
+
+class ElectionAnalyzer:
+    def __init__(self):
+        self.data = {
+            'uiks': [],
+            'voters': [],
+            'turnout': [],
+            'candidates': {}
+        }
+        self.current_candidate_idx = 0
+        self.original_distribution = None
+        self.gauss_distribution = None
+        self.colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
+                       '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
+        self.gauss_params = {'mean': 0, 'std': 1, 'scale': 1}
+        self.threshold = None
+        self.anomalous_votes = 0
+        self.app = None
+        self.current_candidate_name = ""
+        self.loaded = False
+        self.corrected_peaks = []
+        self.selected_threshold = None
+        self.locked_gauss_points = None
+        self.final_results = {}
+        self.all_gauss_distributions = {}
+
+    def load_data(self):
+        print("\n=== ЗАГРУЗКА ДАННЫХ ===")
+        uik_file = input("Введите название файла с УИК (без .txt): ").strip() + ".txt"
+        self.data['uiks'] = self._load_txt_file(uik_file, str)
+
+        voters_file = input("Введите название файла с избирателями (без .txt): ").strip() + ".txt"
+        self.data['voters'] = self._load_txt_file(voters_file, int)
+
+        turnout_file = input("Введите название файла с явкой (без .txt): ").strip() + ".txt"
+        self.data['turnout'] = self._load_txt_file(turnout_file, int)
+
+        print("\nЗагрузка данных по кандидатам:")
+        while True:
+            cand_file = input("Введите название файла кандидата (без .txt, Enter чтобы закончить): ").strip()
+            if not cand_file:
+                break
+            cand_file += ".txt"
+            cand_name = cand_file.split('.')[0].split('_')[-1] if '_' in cand_file else cand_file.split('.')[0]
+            self.data['candidates'][cand_name] = self._load_txt_file(cand_file, int)
+
+        self.loaded = True
+
+    def _load_txt_file(self, filename, dtype):
+        try:
+            with open(filename, 'r', encoding='utf-8') as f:
+                content = f.read().strip()
+                return [dtype(x.strip()) for x in content.split() if x.strip()]
+        except Exception as e:
+            raise ValueError(f"Ошибка в файле {filename}: {str(e)}")
+
+    def validate_data(self):
+        errors = []
+        num_uiks = len(self.data['uiks'])
+        for field in ['voters', 'turnout']:
+            if len(self.data[field]) != num_uiks:
+                errors.append(f"Несоответствие количества записей в {field}")
+        for cand, votes in self.data['candidates'].items():
+            if len(votes) != num_uiks:
+                errors.append(f"Несоответствие данных для {cand}")
+        for i in range(num_uiks):
+            if self.data['turnout'][i] > self.data['voters'][i]:
+                errors.append(f"УИК {self.data['uiks'][i]}: явка > избирателей")
+            total_votes = sum(cand_votes[i] for cand_votes in self.data['candidates'].values())
+            if total_votes > self.data['turnout'][i]:
+                errors.append(f"УИК {self.data['uiks'][i]}: голосов > явки")
+        return not bool(errors), errors
+
+    def show_initial_summary(self):
+        total_voters = sum(self.data['voters'])
+        total_turnout = sum(self.data['turnout'])
+        print("\n=== ПРЕДВАРИТЕЛЬНАЯ СВОДКА ===")
+        print(f"Участков: {len(self.data['uiks'])}")
+        print(f"Избирателей: {total_voters}")
+        print(f"Явка: {total_turnout} ({total_turnout / total_voters * 100:.2f}%)")
+        print("\nПРЕДВАРИТЕЛЬНЫЕ РЕЗУЛЬТАТЫ:")
+        for candidate, votes in self.data['candidates'].items():
+            # Защита от деления на ноль
+            total_votes_sum = sum(votes)
+            percent = total_votes_sum / total_turnout * 100 if total_turnout > 0 else 0
+            print(f"{candidate}: {total_votes_sum} голосов ({percent:.2f}%)")
+
+    def plot_all_candidates(self):
+        fig = go.Figure()
+
+        for idx, (candidate, votes) in enumerate(self.data['candidates'].items()):
+            turnout_percentages = []
+            votes_list = []
+
+            for i in range(len(self.data['uiks'])):
+                if self.data['voters'][i] > 0:
+                    turnout_percent = int(round((self.data['turnout'][i] / self.data['voters'][i]) * 100))
+                    turnout_percentages.append(turnout_percent)
+                    votes_list.append(votes[i])
+
+            unique_percents = np.unique(turnout_percentages)
+            grouped_votes = {p: 0 for p in unique_percents}
+            for p, v in zip(turnout_percentages, votes_list):
+                grouped_votes[p] += v
+
+            x = np.array(list(grouped_votes.keys()))
+            y = np.array(list(grouped_votes.values()))
+
+            fig.add_trace(go.Scatter(
+                x=x,
+                y=y,
+                mode='lines+markers',
+                name=candidate,
+                marker=dict(color=self.colors[idx % len(self.colors)], size=8),
+                line=dict(color=self.colors[idx % len(self.colors)], width=2)
+            ))
+
+        fig.update_layout(
+            title='Фактические данные всех кандидатов',
+            xaxis_title='Явка (%)',
+            yaxis_title='Количество голосов',
+            legend_title="Кандидаты",
+            hovermode="x unified",
+            template="plotly_white",
+            xaxis_range=[0, 100]
+        )
+
+        return fig
+
+    def create_candidate_by_uik_plot(self):
+        fig = go.Figure()
+
+        for idx, (candidate, votes) in enumerate(self.data['candidates'].items()):
+            percentages = []
+            uik_numbers = []
+
+            for i in range(len(self.data['uiks'])):
+                turnout = self.data['turnout'][i]
+                if turnout > 0:
+                    candidate_percent = (votes[i] / turnout) * 100
+                    percentages.append(candidate_percent)
+                    uik_numbers.append(self.data['uiks'][i])
+
+            fig.add_trace(go.Scatter(
+                x=uik_numbers,
+                y=percentages,
+                mode='markers',
+                name=candidate,
+                marker=dict(color=self.colors[idx % len(self.colors)], size=8),
+            ))
+
+        fig.update_layout(
+            title='Процентный результат кандидата по УИК',
+            xaxis_title='Номер УИК',
+            yaxis_title='Процент голосов (%)',
+            legend_title="Кандидаты",
+            hovermode="closest",
+            template="plotly_white",
+            yaxis_range=[0, 100]
+        )
+        return fig
+
+    def analyze_next_candidate(self):
+        if self.current_candidate_idx >= len(self.data['candidates']):
+            return False
+
+        candidate_name = list(self.data['candidates'].keys())[self.current_candidate_idx]
+        self.current_candidate_name = candidate_name
+        # current_candidate_idx управляется в run_dash_app
+        # self.current_candidate_idx += 1
+
+        turnout_percentages = []
+        votes_list = []
+        for i in range(len(self.data['uiks'])):
+            if self.data['voters'][i] > 0:
+                turnout_pct = int(round((self.data['turnout'][i] / self.data['voters'][i]) * 100))
+                turnout_percentages.append(turnout_pct)
+                votes_list.append(self.data['candidates'][candidate_name][i])
+
+        unique_percents = np.unique(turnout_percentages)
+        grouped_votes = {p: 0 for p in unique_percents}
+        for p, v in zip(turnout_percentages, votes_list):
+            grouped_votes[p] += v
+
+        x = np.array(list(grouped_votes.keys()))
+        y = np.array(list(grouped_votes.values()))
+
+        self.original_distribution = (x, y)
+        self.fit_gaussian(y, x)
+        return True
+
+    def fit_gaussian(self, y_data, x_data):
+        try:
+            peak_idx = np.argmax(y_data)
+            mean_guess = x_data[peak_idx]
+            std_guess = np.sqrt(np.sum(y_data * (x_data - mean_guess) ** 2) / np.sum(y_data)) if np.sum(
+                y_data) > 0 else 1
+            scale_guess = np.max(y_data)
+
+            def gauss_model(x, m, s, sc):
+                return sc * np.exp(-0.5 * ((x - m) / s) ** 2)
+
+            popt, _ = curve_fit(
+                gauss_model,
+                x_data,
+                y_data,
+                p0=[mean_guess, std_guess, scale_guess],
+                bounds=([0, 0.1, 0], [100, 50, np.inf]),
+                maxfev=10000
+            )
+
+            self.gauss_params = {
+                'mean': popt[0],
+                'std': max(popt[1], 0.1),
+                'scale': popt[2]
+            }
+
+            x_points = np.arange(0, 101, 1)
+            gauss_points = self.gauss_params['scale'] * np.exp(
+                -0.5 * ((x_points - self.gauss_params['mean']) / self.gauss_params['std']) ** 2)
+
+            self.gauss_distribution = {
+                'points': (x_points, gauss_points),
+                'peak_turnout': self.gauss_params['mean']
+            }
+
+        except Exception as e:
+            # print(f"Ошибка подгонки Гаусса: {e}")
+            x_points = np.arange(0, 101, 1)
+            gauss_points = np.zeros_like(x_points)
+            self.gauss_distribution = {
+                'points': (x_points, gauss_points),
+                'peak_turnout': 0
+            }
+
+    def smooth_data(self, x_data, y_data, window_length, polyorder=2):
+        try:
+            window_length = int(window_length)
+            if window_length % 2 == 0:
+                window_length += 1
+            if window_length < 3:
+                window_length = 3
+
+            window_length = min(window_length, len(y_data))
+
+            if len(y_data) < window_length:
+                return x_data, y_data
+
+            smoothed_y = savgol_filter(y_data, window_length, polyorder)
+            return x_data, smoothed_y
+        except (ValueError, TypeError):
+            # В случае некорректного ввода, возвращаем исходные данные
+            return x_data, y_data
+
+    def create_interactive_plot(self, smoothing_value):
+        fig = go.Figure()
+        x_orig, y_orig = self.original_distribution
+
+        fig.add_trace(go.Scatter(
+            x=x_orig,
+            y=y_orig,
+            mode='markers',
+            name='Фактические данные',
+            marker=dict(color='gray', size=10),
+            opacity=0.8
+        ))
+        fig.add_trace(go.Scatter(
+            x=x_orig,
+            y=y_orig,
+            mode='lines',
+            name='Фактические данные',
+            line=dict(color='gray', width=1),
+            showlegend=False
+        ))
+
+        x_smoothed, y_smoothed = self.smooth_data(x_orig, y_orig, smoothing_value)
+        fig.add_trace(go.Scatter(
+            x=x_smoothed,
+            y=y_smoothed,
+            mode='lines',
+            name='Сглаженная кривая',
+            line=dict(color='green', width=2),
+        ))
+
+        if self.gauss_distribution and 'points' in self.gauss_distribution:
+            x_gauss_points, y_gauss_points = self.gauss_distribution['points']
+            fig.add_trace(go.Scatter(
+                x=x_gauss_points,
+                y=y_gauss_points,
+                mode='lines',
+                name='Идеальное распределение',
+                line=dict(color='blue', width=3)
+            ))
+            fig.add_trace(go.Scatter(
+                x=x_gauss_points,
+                y=y_gauss_points,
+                mode='markers',
+                name='Идеальное распределение (точки)',
+                marker=dict(color='blue', size=6),
+                opacity=0.6,
+                showlegend=False
+            ))
+
+        fig.update_layout(
+            title=f'Анализ кандидата: {self.current_candidate_name}',
+            xaxis_title='Явка (%)',
+            yaxis_title='Количество голосов',
+            legend_title="Легенда",
+            hovermode="x unified",
+            template="plotly_white",
+            xaxis_range=[0, 100],
+            yaxis_range=[0, np.max(y_orig) * 1.1 if len(y_orig) > 0 else 1]
+        )
+
+        return fig
+
+    def calculate_final_results(self, total_voters_override=None):
+        self.final_results = {}
+        total_idealized_voters = total_voters_override if total_voters_override is not None else sum(
+            self.data['voters'])
+        total_idealized_votes = 0
+
+        # Сначала вычисляем идеализированные голоса для каждого кандидата
+        for candidate, distribution in self.all_gauss_distributions.items():
+            peak_turnout = distribution['peak_turnout']
+
+            # Находим значение голосов на пике идеализированной кривой
+            # Округляем до ближайшего целого, чтобы использовать как индекс
+            peak_turnout_index = int(round(peak_turnout))
+            if peak_turnout_index >= len(distribution['points'][1]):
+                peak_turnout_index = len(distribution['points'][1]) - 1
+            # Защита от отрицательного индекса
+            if peak_turnout_index < 0:
+                peak_turnout_index = 0
+            peak_value = distribution['points'][1][peak_turnout_index]
+
+            # Суммируем голоса всех кандидатов на этой конкретной идеализированной явке
+            total_votes_at_peak = sum([
+                self.all_gauss_distributions[c]['points'][1][peak_turnout_index]
+                for c in self.all_gauss_distributions
+            ])
+
+            # Процент голосов за кандидата на идеализированной явке
+            if total_votes_at_peak > 0:
+                candidate_percent_at_peak = peak_value / total_votes_at_peak
+            else:
+                candidate_percent_at_peak = 0
+
+            # Идеализированное общее количество голосов за кандидата
+            idealized_votes = total_idealized_voters * (peak_turnout / 100) * candidate_percent_at_peak
+
+            self.final_results[candidate] = {
+                'votes': idealized_votes,
+                'peak_turnout': peak_turnout,
+                'percent': 0
+            }
+            total_idealized_votes += idealized_votes
+
+        # Затем вычисляем итоговые проценты
+        if total_idealized_votes > 0:
+            for candidate in self.final_results:
+                self.final_results[candidate]['percent'] = (
+                        self.final_results[candidate]['votes'] / total_idealized_votes * 100
+                )
+
+        # Вычисляем идеализированную явку
+        self.idealized_turnout_percent = (
+                                                 total_idealized_votes / total_idealized_voters) * 100 if total_idealized_voters > 0 else 0
+
+    def create_final_plot(self):
+        fig = go.Figure()
+        for idx, (candidate, distribution) in enumerate(self.all_gauss_distributions.items()):
+            x, y = distribution['points']
+            fig.add_trace(go.Scatter(
+                x=x,
+                y=y,
+                mode='lines',
+                name=candidate,
+                line=dict(color=self.colors[idx % len(self.colors)])
+            ))
+
+        fig.update_layout(
+            title='Идеализированные распределения голосов по явке',
+            xaxis_title='Явка (%)',
+            yaxis_title='Количество голосов',
+            legend_title="Кандидаты",
+            template="plotly_white",
+            xaxis_range=[0, 100]
+        )
+        return fig
+
+    def show_final_summary(self):
+        report = "\n=== ФИНАЛЬНЫЕ РЕЗУЛЬТАТЫ (на основе кривых Гаусса) ===\n"
+        total_voters = sum(self.data['voters'])
+
+        report += f"Общее число избирателей: {total_voters}\n"
+        report += f"Идеализированная явка: {self.idealized_turnout_percent:.2f}%\n"
+        report += "--------------------------------------------------------\n"
+        for candidate, data in self.final_results.items():
+            report += f"{candidate}:\n"
+            report += f"  Идеализированная явка: {data['peak_turnout']:.2f}%\n"
+            report += f"  Идеализированные голоса: {int(data['votes'])} ({data['percent']:.2f}%)\n\n"
+
+        print(report)
+        return html.Pre(report)
+
+    def run_dash_app(self):
+        if not self.loaded:
+            print("Данные не загружены!")
+            return
+
+        self.app = Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
+
+        initial_fig = self.plot_all_candidates()
+
+        # --- ИЗМЕНЕНИЕ: УСЛОВНОЕ ДОБАВЛЕНИЕ ГРАФИКА ПО УИК (ИЗ ПРЕДЫДУЩЕГО ЗАПРОСА) ---
+        total_voters = sum(self.data.get('voters', []))
+        uik_plot_component = []
+
+        # Если общее число избирателей НЕ превышает 10 миллионов, добавляем график
+        if total_voters <= 10000000:
+            uik_fig = self.create_candidate_by_uik_plot()
+            uik_plot_component = [
+                html.H2("Процентный результат кандидата по УИК"),
+                dcc.Graph(id='uik-graph', figure=uik_fig),
+            ]
+        # -----------------------------------------------------------------------------
+
+        self.app.layout = html.Div([
+            dcc.Store(id='store-candidate-idx', data=0),
+            dcc.Store(id='click-data-store'),
+
+            html.H1("Анализ результатов выборов", style={'textAlign': 'center'}),
+
+            html.H2("Фактические данные всех кандидатов"),
+            dcc.Graph(id='initial-graph', figure=initial_fig),
+
+            # Вставляем компонент графика по УИК. Если voters > 10M, будет вставлен пустой список.
+            *uik_plot_component,
+
+            html.Div(id='summary-div'),
+
+            dcc.Graph(
+                id='main-graph',
+                config={'displayModeBar': True},
+                clickData=None
+            ),
+
+            html.Div([
+                html.H3("Настройка кривых"),
+                dbc.Row([
+                    dbc.Col([
+                        dbc.Label("Среднее (Гаусс):"),
+                        dbc.Input(id='mean-input', type='number', value=self.gauss_params['mean'],
+                                  min=0, max=100, step=0.1)
+                    ], width=3),
+                    dbc.Col([
+                        dbc.Label("Станд. отклонение (Гаусс):"),
+                        dbc.Input(id='std-input', type='number', value=self.gauss_params['std'],
+                                  min=0.1, max=20, step=0.1)
+                    ], width=3),
+                    dbc.Col([
+                        dbc.Label("Масштаб (Гаусс):"),
+                        dbc.Input(id='scale-input', type='number', value=self.gauss_params['scale'],
+                                  min=0.1, max=1000000000, step=0.1)
+                    ], width=3),
+                    dbc.Col([
+                        dbc.Label("Сглаживание (Савицкий-Голей):"),
+                        dbc.Input(id='smoothing-input', type='number', value=7, min=3, step=2)
+                    ], width=3),
+                ]),
+            ], style={'margin': '20px'}),
+
+            html.Div([
+                dbc.Button('Фиксировать кривую Гаусса и перейти к следующему', id='lock-next-button', n_clicks=0,
+                           color="warning", className="mr-2"),
+            ], style={'margin': '20px'}),
+
+            html.Div(id='final-results-div'),
+
+            dcc.Graph(id='final-graph'),
+
+        ], style={'padding': '20px'})
+
+        @self.app.callback(
+            Output('main-graph', 'figure'),
+            [Input('mean-input', 'value'),
+             Input('std-input', 'value'),
+             Input('scale-input', 'value'),
+             Input('smoothing-input', 'value')],
+            [State('store-candidate-idx', 'data')]
+        )
+        def update_graph(mean, std, scale, smoothing_value, candidate_idx):
+            if None in [mean, std, scale] or self.original_distribution is None:
+                return no_update
+
+            # Преобразование в float с защитой от None
+            try:
+                mean = float(mean) if mean is not None else self.gauss_params['mean']
+                std = float(std) if std is not None else self.gauss_params['std']
+                scale = float(scale) if scale is not None else self.gauss_params['scale']
+            except ValueError:
+                return no_update
+
+            self.gauss_params = {
+                'mean': mean,
+                'std': max(std, 0.1),  # Защита от std=0 или отрицательного
+                'scale': scale
+            }
+
+            x_points = np.arange(0, 101, 1)
+            gauss_points = self.gauss_params['scale'] * np.exp(
+                -0.5 * ((x_points - self.gauss_params['mean']) / self.gauss_params['std']) ** 2)
+
+            self.gauss_distribution = {
+                'points': (x_points, gauss_points),
+                'peak_turnout': self.gauss_params['mean']
+            }
+
+            return self.create_interactive_plot(smoothing_value)
+
+        @self.app.callback(
+            [Output('summary-div', 'children'),
+             Output('main-graph', 'figure', allow_duplicate=True),
+             Output('store-candidate-idx', 'data'),
+             Output('smoothing-input', 'value')],
+            [Input('lock-next-button', 'n_clicks')],
+            [State('store-candidate-idx', 'data')],
+            prevent_initial_call=True
+        )
+        def handle_next(n_clicks, candidate_idx):
+            # Проверяем, был ли начальный анализ уже сделан (в main)
+            if self.original_distribution is None and candidate_idx < len(self.data['candidates']):
+                self.analyze_next_candidate()
+
+            if n_clicks is None or n_clicks == 0:
+                # Инициализация при первом запуске
+                if candidate_idx < len(self.data['candidates']):
+                    candidate_name = list(self.data['candidates'].keys())[candidate_idx]
+                    summary = html.Div([
+                        html.H3(f"Анализ кандидата: {candidate_name}"),
+                        html.P(f"Всего голосов: {sum(self.data['candidates'][candidate_name])}"),
+                        html.P(
+                            "1. Настройте параметры Гаусса\n2. Нажмите 'Фиксировать кривую Гаусса и перейти к следующему'")
+                    ])
+                    return summary, self.create_interactive_plot(7), candidate_idx, 7
+                return no_update, no_update, no_update, no_update
+
+            # Логика обработки нажатия кнопки
+            if self.gauss_distribution:
+                self.all_gauss_distributions[self.current_candidate_name] = self.gauss_distribution
+                x_points, y_points = self.gauss_distribution['points']
+                print(f"\n=== ЗАФИКСИРОВАННАЯ ГАУССОВА КРИВАЯ ДЛЯ КАНДИДАТА: {self.current_candidate_name} ===")
+                print(f"Среднее: {self.gauss_params['mean']:.2f}, Станд. отклонение: {self.gauss_params['std']:.2f}")
+
+            if candidate_idx + 1 >= len(self.data['candidates']):
+                # ФИНАЛЬНЫЙ РАСЧЕТ
+                try:
+                    new_total_voters = input(
+                        "\nВведите общее число избирателей для финального расчета (оставьте пустым, чтобы использовать исходное): ")
+                    if new_total_voters.strip():
+                        new_total_voters = int(new_total_voters)
+                        self.calculate_final_results(new_total_voters)
+                    else:
+                        self.calculate_final_results()
+                except ValueError:
+                    print("Ошибка: Введено некорректное число. Используется исходное значение.")
+                    self.calculate_final_results()
+
+                final_fig = self.create_final_plot()
+                final_report = self.show_final_summary()
+                return final_report, final_fig, candidate_idx, no_update
+
+            # ПЕРЕХОД К СЛЕДУЮЩЕМУ КАНДИДАТУ
+            candidate_idx += 1
+            candidate_name = list(self.data['candidates'].keys())[candidate_idx]
+            self.current_candidate_name = candidate_name
+            self.current_candidate_idx = candidate_idx
+
+            # Загрузка данных для следующего кандидата
+            turnout_percentages = []
+            votes_list = []
+            current_candidate_votes = self.data['candidates'][candidate_name]
+
+            for i in range(len(self.data['uiks'])):
+                if self.data['voters'][i] > 0:
+                    turnout_percent = int(round((self.data['turnout'][i] / self.data['voters'][i]) * 100))
+                    turnout_percentages.append(turnout_percent)
+                    votes_list.append(current_candidate_votes[i])
+
+            unique_percents = np.unique(turnout_percentages)
+            grouped_votes = {p: 0 for p in unique_percents}
+            for p, v in zip(turnout_percentages, votes_list):
+                grouped_votes[p] += v
+
+            x = np.array(list(grouped_votes.keys()))
+            y = np.array(list(grouped_votes.values()))
+
+            self.original_distribution = (x, y)
+            self.fit_gaussian(y, x)  # Автоматически подгоняем новую кривую Гаусса
+
+            summary = html.Div([
+                html.H3(f"Анализ кандидата: {candidate_name}"),
+                html.P(f"Всего голосов: {sum(votes_list)}"),
+                html.P(
+                    "1. Настройте параметры Гаусса\n2. Нажмите 'Фиксировать кривую Гаусса и перейти к следующему'")
+            ])
+
+            # Возвращаем новую фигуру и обновляем индекс
+            return summary, self.create_interactive_plot(7), candidate_idx, 7
+
+        def open_browser():
+            webbrowser.open_new("http://127.0.0.1:8050/")
+
+        Timer(1, open_browser).start()
+        # ИСПРАВЛЕНИЕ: ВОЗВРАТ НА app.run, как того требует ваша старая версия Dash
+        self.app.run(debug=False)
+
+
+def main():
+    print("=== АНАЛИЗ РЕЗУЛЬТАТОВ ВЫБОРОВ ===")
+    analyzer = ElectionAnalyzer()
+
+    try:
+        analyzer.load_data()
+        is_valid, errors = analyzer.validate_data()
+        if not is_valid:
+            print("\nОШИБКИ В ДАННЫХ:")
+            for error in errors:
+                print(f"- {error}")
+            return
+
+        analyzer.show_initial_summary()
+
+        # Анализируем первого кандидата перед запуском Dash
+        if analyzer.analyze_next_candidate():
+            analyzer.run_dash_app()
+        else:
+            print("Нет данных кандидатов для анализа")
+
+    except Exception as e:
+        print(f"\nФАТАЛЬНАЯ ОШИБКА: {e}")
+
+
+if __name__ == "__main__":
+    main()
