@@ -1,0 +1,483 @@
+# poker_calculator_v16.py
+# Техасский Холдем: Equity, Келли и Калькулятор Решений (Монте-Карло)
+# НОВОЕ: Ограничение Префлоп Риска (15% от стека) теперь отключается, если за столом <= 2 игроков (хедз-ап).
+
+import random
+import tkinter as tk
+from tkinter import ttk, messagebox
+from itertools import combinations
+from collections import Counter
+
+# --- 1. Основные константы и функции для работы с картами ---
+
+RANKS = '23456789TJQKA'
+SUITS = 'чбпк'
+# ИСПРАВЛЕНИЕ ОШИБКИ NameError: переменная 's' должна использоваться для SUITS
+ALL_CARDS = [r + s for r in RANKS for s in SUITS]
+
+
+def get_hand_value(cards):
+    best_value = 0
+    if len(cards) < 5:
+        return 0
+
+    for five_cards_tuple in combinations(cards, 5):
+        five_cards = list(five_cards_tuple)
+        ranks = sorted([RANKS.index(c[0]) for c in five_cards], reverse=True)
+        suits = [c[1] for c in five_cards]
+        rank_counts = Counter(ranks).most_common()
+        is_flush = len(set(suits)) == 1
+
+        is_straight = all(ranks[i] == ranks[i + 1] + 1 for i in range(4))
+        if ranks == [12, 3, 2, 1, 0]:
+            is_straight = True
+            straight_high_rank = 3
+        else:
+            straight_high_rank = ranks[0]
+
+        value = 0
+
+        if is_straight and is_flush:
+            value = 8000000 + straight_high_rank
+        elif rank_counts[0][1] == 4:
+            value = 7000000 + rank_counts[1][0] * 15 + rank_counts[0][0]
+        elif rank_counts[0][1] == 3 and rank_counts[1][1] == 2:
+            value = 6000000 + rank_counts[0][0] * 15 + rank_counts[1][0]
+        elif is_flush:
+            value = 5000000 + ranks[0] * 15 ** 4 + ranks[1] * 15 ** 3 + ranks[2] * 15 ** 2 + ranks[3] * 15 + ranks[4]
+        elif is_straight:
+            value = 4000000 + straight_high_rank
+        elif rank_counts[0][1] == 3:
+            value = 3000000 + rank_counts[0][0] * 15 ** 2 + rank_counts[1][0] * 15 + rank_counts[2][0]
+        elif rank_counts[0][1] == 2 and rank_counts[1][1] == 2:
+            value = 2000000 + max(rank_counts[0][0], rank_counts[1][0]) * 15 ** 2 + min(rank_counts[0][0],
+                                                                                        rank_counts[1][0]) * 15 + \
+                    rank_counts[2][0]
+        elif rank_counts[0][1] == 2:
+            value = 1000000 + rank_counts[0][0] * 15 ** 3 + rank_counts[1][0] * 15 ** 2 + rank_counts[2][0] * 15 + \
+                    rank_counts[3][0]
+        else:
+            value = ranks[0] * 15 ** 4 + ranks[1] * 15 ** 3 + ranks[2] * 15 ** 2 + ranks[3] * 15 + ranks[4]
+
+        best_value = max(best_value, value)
+
+    return best_value
+
+
+# --- 2. Логика Монте-Карло ---
+
+def calculate_equity_monte_carlo(my_hand, board_cards, num_opponents, num_simulations=20000):
+    known_cards = set(my_hand + board_cards)
+    deck = [card for card in ALL_CARDS if card not in known_cards]
+    my_wins = 0
+    my_ties = 0
+
+    for _ in range(num_simulations):
+        required_opponent_cards = num_opponents * 2
+        required_board_cards = 5 - len(board_cards)
+        total_required = required_opponent_cards + required_board_cards
+
+        if total_required > len(deck): continue
+
+        simulation_cards = random.sample(deck, total_required)
+
+        opponent_hands = []
+        for i in range(num_opponents):
+            opponent_hands.append(simulation_cards[i * 2: i * 2 + 2])
+
+        simulated_board = board_cards + simulation_cards[required_opponent_cards:]
+
+        my_best_value = get_hand_value(my_hand + simulated_board)
+        opponent_values = [get_hand_value(hand + simulated_board) for hand in opponent_hands]
+
+        max_opponent_value = max(opponent_values) if opponent_values else 0
+
+        if my_best_value > max_opponent_value:
+            my_wins += 1
+        elif my_best_value == max_opponent_value:
+            my_ties += 1
+
+    equity = (my_wins + my_ties / (num_opponents + 1)) / num_simulations
+
+    return equity
+
+
+# --- 3. Формула Келли и Обновленная Логика Решений ---
+
+def kelly_criterion(probability_win, payout_ratio):
+    """ Расчет оптимальной доли от банкролла (стека) по формуле Келли. """
+    if payout_ratio <= 0: return 0.0
+    f = probability_win - (1.0 - probability_win) / payout_ratio
+    return max(0.0, f)
+
+
+def decision_recommendation(equity, current_pot, bet_to_call, num_board_cards, num_opponents, my_stack, total_chips,
+                            kelly_fraction, total_players_at_table):
+    """
+    Дает рекомендацию с учетом ICM-защиты, ограничения риска на префлопе и Pot Odds.
+    """
+
+    # Флаг для определения, являемся ли мы в хедз-апе или меньше (ICM/Риск не применяется)
+    is_headsup_or_less = total_players_at_table <= 2
+
+    # 1. Защита стека (ICM-защита)
+    is_icm_protection_active = my_stack / total_chips > 0.60
+
+    if is_icm_protection_active and not is_headsup_or_less:
+        return "ЧЕК/ФОЛД (CHECK/FOLD)", "РЕЖИМ ЗАЩИТЫ СТЕКА (ICM Protection Mode). Стек > 60% и игроков за столом > 2."
+
+    # 2. ОГРАНИЧЕНИЕ РИСКА НА ПРЕФЛОПЕ (15% от стека)
+    IS_PREFLOP = num_board_cards == 0
+    MAX_PREFLOP_STAKE_PERCENT = 0.15
+
+    # Применяем ограничение ТОЛЬКО если это префлоп И не хедз-ап
+    if IS_PREFLOP and my_stack > 0 and not is_headsup_or_less:
+        max_allowed_call = my_stack * MAX_PREFLOP_STAKE_PERCENT
+
+        if bet_to_call > max_allowed_call:
+            return "ФОЛД (FOLD)", f"ОГРАНИЧЕНИЕ РИСКА (Risk Limit). Колл ({bet_to_call} фишек) превышает {MAX_PREFLOP_STAKE_PERCENT * 100:.0f}% Вашего Стека ({max_allowed_call:.0f} фишек) на префлопе (Игроков > 2)."
+
+    # 3. ЗАЩИТА СТЕКА ОТ ОЛЛ-ИН (All-in Protection)
+    ALL_IN_REQUIRED_EQUITY = 0.70  # Требуем 70% Equity для колла на весь стек
+
+    if my_stack > 0 and bet_to_call >= my_stack:
+        if equity < ALL_IN_REQUIRED_EQUITY:
+            return "ФОЛД (FOLD)", f"ОГРАНИЧЕНИЕ ОЛЛ-ИН. Колл на весь стек ({my_stack} фишек) требует Equity > 70%, у Вас {equity * 100:.2f}%."
+        else:
+            # Если Equity > 70%, то это ОЛЛ-ИН КОЛЛ
+            return "ОЛЛ-ИН КОЛЛ (ALL-IN CALL)", "Обоснованный Олл-ин! Высокая Equity оправдывает риск всего стека."
+
+    # Расчет Pot Odds (Требуемая Equity)
+    required_equity = bet_to_call / (current_pot + bet_to_call)
+
+    KELLY_RAISE_THRESHOLD = 0.005  # 0.5%
+
+    # 4. Фолд (Стандартное условие Pot Odds)
+    if equity < required_equity * 0.95:
+        return "ФОЛД (FOLD)", "Ваша Equity < Pot Odds. Не выгодно уравнивать."
+
+    # 5. Решение на Ривере
+    is_river = num_board_cards == 5
+    if is_river:
+
+        # A. Условие Рейза
+        if equity > required_equity * 1.5 and kelly_fraction > KELLY_RAISE_THRESHOLD:
+            return "РЕЙЗ (RAISE)", "Высокая Equity и Келли рекомендуют увеличение ставки."
+
+        # B. Условие строгого ЧЕК/ФОЛД
+        elif kelly_fraction <= KELLY_RAISE_THRESHOLD:
+            return "ЧЕК/ФОЛД (CHECK/FOLD)", "Equity > Pot Odds, но Келли f ≈ 0. Рейз/колл не оптимален."
+
+        # C. Условие Колла
+        else:
+            return "КОЛЛ (CALL)", "Выгодно уравнивать (Equity > Pot Odds)."
+
+
+    # 6. Решение до Ривера (Максимум Колл)
+    else:
+        # Equity значительно выше Pot Odds
+        if equity > required_equity * 1.5:
+            return "КОЛЛ (CALL)", "Высокая Equity. Выгодно увеличивать банк (максимум - колл)."
+        else:
+            return "КОЛЛ (CALL)", "Ваша Equity > Pot Odds. Выгодно уравнивать."
+
+
+# --- 7. Графический интерфейс (Tkinter) ---
+
+class PokerEquityCalculator(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Техасский Холдем: Equity и Келли Калькулятор (Texas Hold'em: Equity and Kelly Calculator)")
+        self.geometry("800x680")
+
+        self.card_options = [" "] + ALL_CARDS
+
+        # --- Переменные для карт ---
+        self.my_hand_vars = [tk.StringVar(self), tk.StringVar(self)]
+        for var in self.my_hand_vars: var.set(" ")
+
+        self.board_vars = [tk.StringVar(self) for _ in range(5)]
+        for var in self.board_vars: var.set(" ")
+
+        # --- Переменные для Фишек (Целочисленные - tk.IntVar) ---
+        self.num_opponents_var = tk.IntVar(self)
+        self.num_opponents_var.set(2)
+
+        self.pot_size_var = tk.IntVar(self)
+        self.pot_size_var.set(100)
+
+        self.bet_to_call_var = tk.IntVar(self)
+        self.bet_to_call_var.set(10)
+
+        self.my_stack_var = tk.IntVar(self)
+        self.my_stack_var.set(1000)
+
+        self.total_chips_var = tk.IntVar(self)
+        self.total_chips_var.set(1600)
+
+        self.total_players_at_table_var = tk.IntVar(self)
+        self.total_players_at_table_var.set(6)
+
+        self.create_widgets()
+
+    def create_widgets(self):
+
+        main_frame = ttk.Frame(self, padding="10")
+        main_frame.pack(fill='both', expand=True)
+
+        # Секция 1: Ввод карт и игроков
+        cards_frame = ttk.LabelFrame(main_frame, text="1. Ввод карт и соперников (Card and Opponent Input)",
+                                     padding="10")
+        cards_frame.pack(fill='x', pady=10)
+
+        # Моя рука
+        ttk.Label(cards_frame, text="Моя рука (My Hand):", font=('Arial', 10, 'bold')).grid(row=0, column=0, padx=5,
+                                                                                            pady=5, sticky='w')
+        for i in range(2):
+            card_menu = ttk.Combobox(cards_frame, textvariable=self.my_hand_vars[i], values=self.card_options, width=5,
+                                     state='readonly')
+            card_menu.grid(row=0, column=i + 1, padx=5)
+
+        # Карты на столе
+        ttk.Label(cards_frame, text="Карты на столе (Board Cards):", font=('Arial', 10, 'bold')).grid(row=1, column=0,
+                                                                                                      padx=5, pady=5,
+                                                                                                      sticky='w')
+        for i in range(5):
+            card_menu = ttk.Combobox(cards_frame, textvariable=self.board_vars[i], values=self.card_options, width=5,
+                                     state='readonly')
+            card_menu.grid(row=1, column=i + 1, padx=5)
+
+        # Количество соперников
+        ttk.Label(cards_frame, text="Количество активных соперников (Active Opponents, 1-7):",
+                  font=('Arial', 10, 'bold')).grid(row=2, column=0, padx=5, pady=5, sticky='w')
+        opp_spinbox = ttk.Spinbox(cards_frame, from_=1, to=7, textvariable=self.num_opponents_var, width=5)
+        opp_spinbox.grid(row=2, column=1, padx=5, sticky='w')
+
+        # --- Кнопка Сброса ---
+        ttk.Button(cards_frame, text="СБРОСИТЬ ВСЁ (RESET ALL)", command=self.reset_inputs).grid(row=0, column=6,
+                                                                                                 rowspan=2, padx=15,
+                                                                                                 sticky='e')
+
+        # Секция 2: Ввод данных для Pot Odds
+        kelly_frame = ttk.LabelFrame(main_frame,
+                                     text="2. Финансовые данные, ICM и Риск (Financial Data, ICM, and Risk)",
+                                     padding="10")
+        kelly_frame.pack(fill='x', pady=10)
+
+        # Мой стек (Stack)
+        ttk.Label(kelly_frame, text="Мой текущий СТЕК (My Current Stack):", font=('Arial', 10, 'bold')).grid(row=0,
+                                                                                                             column=0,
+                                                                                                             padx=5,
+                                                                                                             pady=5,
+                                                                                                             sticky='w')
+        my_stack_entry = ttk.Entry(kelly_frame, textvariable=self.my_stack_var, width=10)
+        my_stack_entry.grid(row=0, column=1, padx=5, sticky='w')
+
+        # Общее количество фишек на столе (Total Chips)
+        ttk.Label(kelly_frame, text="Общее количество фишек на столе (Total Chips in Play):",
+                  font=('Arial', 10, 'bold')).grid(row=1, column=0, padx=5, pady=5, sticky='w')
+        total_chips_entry = ttk.Entry(kelly_frame, textvariable=self.total_chips_var, width=10)
+        total_chips_entry.grid(row=1, column=1, padx=5, sticky='w')
+
+        # Общее количество игроков
+        ttk.Label(kelly_frame, text="Общее количество игроков за столом (Total Players at Table):",
+                  font=('Arial', 10, 'bold')).grid(row=2, column=0, padx=5, pady=5, sticky='w')
+        total_players_entry = ttk.Entry(kelly_frame, textvariable=self.total_players_at_table_var, width=10)
+        total_players_entry.grid(row=2, column=1, padx=5, sticky='w')
+
+        # --- Разделитель ---
+        ttk.Separator(kelly_frame, orient='horizontal').grid(row=3, columnspan=3, sticky='ew', pady=5)
+
+        # Размер банка (Pot)
+        ttk.Label(kelly_frame, text="Текущий общий размер БАНКА (Current Total Pot):", font=('Arial', 10, 'bold')).grid(
+            row=4, column=0, padx=5, pady=5, sticky='w')
+        pot_entry = ttk.Entry(kelly_frame, textvariable=self.pot_size_var, width=10)
+        pot_entry.grid(row=4, column=1, padx=5, sticky='w')
+
+        # Сумма для колла
+        ttk.Label(kelly_frame, text="Сумма для колла (Bet to Call):", font=('Arial', 10, 'bold')).grid(row=5, column=0,
+                                                                                                       padx=5, pady=5,
+                                                                                                       sticky='w')
+        call_entry = ttk.Entry(kelly_frame, textvariable=self.bet_to_call_var, width=10)
+        call_entry.grid(row=5, column=1, padx=5, sticky='w')
+
+        # --- Кнопка Расчета ---
+        ttk.Button(main_frame, text="РАССЧИТАТЬ ВСЁ (CALCULATE ALL - 20,000 simulations)",
+                   command=self.calculate_all).pack(pady=20, fill='x')
+
+        # --- Результаты ---
+        results_frame = ttk.LabelFrame(main_frame, text="3. Результаты расчета (Calculation Results)", padding="10")
+        results_frame.pack(fill='x', pady=10)
+
+        self.equity_label = ttk.Label(results_frame, text="Equity (Вероятность победы / Win Probability): -",
+                                      font=('Arial', 14, 'bold'), foreground='blue')
+        self.equity_label.pack(anchor='w', pady=5)
+
+        ttk.Separator(results_frame, orient='horizontal').pack(fill='x', pady=5)
+
+        self.pot_odds_label = ttk.Label(results_frame, text="Pot Odds (Требуемая Equity / Required Equity): -",
+                                        font=('Arial', 10))
+        self.pot_odds_label.pack(anchor='w', pady=2)
+
+        self.decision_label = ttk.Label(results_frame, text="ОПТИМАЛЬНОЕ РЕШЕНИЕ (OPTIMAL DECISION): -",
+                                        font=('Arial', 14, 'bold'), foreground='red')
+        self.decision_label.pack(anchor='w', pady=10)
+
+        ttk.Separator(results_frame, orient='horizontal').pack(fill='x', pady=5)
+
+        self.kelly_label_f = ttk.Label(results_frame, text="Келли (Kelly Fraction, f) - Только Ривер/Рейз:",
+                                       font=('Arial', 12))
+        self.kelly_label_f.pack(anchor='w', pady=5)
+
+        self.kelly_label_amount = ttk.Label(results_frame, text="Оптимальная Ставка по Келли (от Стека): -",
+                                            font=('Arial', 12))
+        self.kelly_label_amount.pack(anchor='w', pady=5)
+
+    def reset_inputs(self):
+        """ Сбрасывает карты и финансовые данные, которые меняются в каждой раздаче. """
+        for var in self.my_hand_vars:
+            var.set(" ")
+        for var in self.board_vars:
+            var.set(" ")
+
+        # Сброс финансовых полей
+        self.bet_to_call_var.set(0)
+        self.pot_size_var.set(0)  # Сброс банка
+
+        # Сброс меток результатов
+        self.equity_label.config(text="Equity (Вероятность победы / Win Probability): -", foreground='blue')
+        self.pot_odds_label.config(text="Pot Odds (Требуемая Equity / Required Equity): -")
+        self.decision_label.config(text="ОПТИМАЛЬНОЕ РЕШЕНИЕ (OPTIMAL DECISION): -", foreground='red')
+        self.kelly_label_f.config(text="Келли (Kelly Fraction, f) - Только Ривер/Рейз:")
+        self.kelly_label_amount.config(text="Оптимальная Ставка по Келли (от Стека): -")
+
+    def validate_input(self, my_hand, num_opponents, current_pot, bet_to_call, my_stack, total_chips,
+                       total_players_at_table):
+
+        # 1. Проверка карт
+        if len(my_hand) != 2:
+            messagebox.showerror("Ошибка ввода (Input Error)",
+                                 "Вы должны выбрать 2 карты для своей руки (You must select 2 cards for your hand).")
+            return False
+
+        # 2. Проверка соперников и финансов
+        if not (1 <= num_opponents <= 7):
+            messagebox.showerror("Ошибка ввода (Input Error)",
+                                 "Количество активных соперников должно быть от 1 до 7 (Opponents must be 1-7).")
+            return False
+
+        if my_stack <= 0 or total_chips <= 0:
+            messagebox.showerror("Ошибка ввода (Input Error)",
+                                 "Стек и Общие фишки должны быть положительными целыми числами.")
+            return False
+
+        if current_pot < 0 or bet_to_call < 0:
+            messagebox.showerror("Ошибка ввода (Input Error)", "Банк и колл не могут быть отрицательными.")
+            return False
+
+        if total_players_at_table < 1:
+            messagebox.showerror("Ошибка ввода (Input Error)", "Количество игроков за столом должно быть хотя бы 1.")
+            return False
+
+        if my_stack > total_chips:
+            messagebox.showerror("Ошибка ввода (Input Error)",
+                                 "Мой СТЕК не может быть больше, чем общее количество фишек на столе.")
+            return False
+
+        if num_opponents >= total_players_at_table:
+            messagebox.showerror("Ошибка ввода (Input Error)",
+                                 "Активных соперников не может быть больше или равно общему числу игроков за столом (минус вы).")
+            return False
+
+        return True
+
+    def calculate_all(self):
+
+        # Сбор данных
+        my_hand = [v.get() for v in self.my_hand_vars if v.get() != " "]
+        board_cards = [v.get() for v in self.board_vars if v.get() != " "]
+        num_board_cards = len([c for c in board_cards if c != ' '])
+        num_opponents = self.num_opponents_var.get()
+
+        try:
+            current_pot = self.pot_size_var.get()
+            bet_to_call = self.bet_to_call_var.get()
+            my_stack = self.my_stack_var.get()
+            total_chips = self.total_chips_var.get()
+            total_players_at_table = self.total_players_at_table_var.get()
+
+        except tk.TclError:
+            messagebox.showerror("Ошибка ввода (Input Error)",
+                                 "Финансовые поля должны быть целыми числами (Financial fields must be integers).")
+            return
+
+        # Проверка и валидация
+        if not self.validate_input(my_hand, num_opponents, current_pot, bet_to_call, my_stack, total_chips,
+                                   total_players_at_table):
+            return
+
+        # 1. Расчет Equity (Монте-Карло)
+        try:
+            equity_value = calculate_equity_monte_carlo(my_hand, board_cards, num_opponents)
+            equity_percent = equity_value * 100
+        except Exception as e:
+            messagebox.showerror("Ошибка расчета (Calculation Error)", f"Произошла ошибка при симуляции: {e}")
+            self.equity_label.config(text="Equity: Ошибка расчета", foreground='red')
+            return
+
+        # 2. Расчет Pot Odds
+        pot_odds_value = bet_to_call / (current_pot + bet_to_call) if (current_pot + bet_to_call) > 0 else 0
+        pot_odds_percent = pot_odds_value * 100
+
+        # 3. Предварительный расчет Келли f (Только если Ривер)
+        is_river = num_board_cards == 5
+        kelly_fraction = 0.0
+        if is_river:
+            payout_ratio = num_opponents
+            kelly_fraction = kelly_criterion(equity_value, payout_ratio)
+
+        # 4. Рекомендация (Получаем действие)
+        action, reason = decision_recommendation(
+            equity_value, current_pot, bet_to_call, num_board_cards, num_opponents, my_stack, total_chips,
+            kelly_fraction, total_players_at_table
+        )
+
+        # 5. Расчет суммы Келли (для отображения)
+        kelly_amount_from_stack = my_stack * kelly_fraction
+
+        # 6. Обновление GUI
+
+        equity_odds = (1 / equity_value - 1) if equity_value > 0 else float('inf')
+        self.equity_label.config(
+            text=f"Equity (Вероятность победы / Win Probability): {equity_percent:.2f}% ({equity_odds:.1f}:1)",
+            foreground='green')
+
+        pot_odds_for_display = (1 / pot_odds_value - 1) if pot_odds_value > 0 else float('inf')
+        self.pot_odds_label.config(
+            text=f"Pot Odds (Требуемая Equity / Required Equity): {pot_odds_percent:.2f}% ({pot_odds_for_display:.1f}:1)")
+
+        color = 'red' if 'ФОЛД' in action or 'ЧЕК' in action else 'green'
+        self.decision_label.config(text=f"ОПТИМАЛЬНОЕ РЕШЕНИЕ (OPTIMAL DECISION): {action} ({reason})",
+                                   foreground=color)
+
+        # 7. Обновление Келли
+        if is_river and "ЗАЩИТЫ СТЕКА" not in reason:
+            payout_ratio = num_opponents
+
+            if kelly_fraction > 0.005:
+                self.kelly_label_f.config(
+                    text=f"Келли (Kelly Fraction, f): {kelly_fraction * 100:.2f}% (b = {payout_ratio:.2f})")
+                self.kelly_label_amount.config(
+                    text=f"Оптимальная Ставка по Келли (от Стека): {kelly_amount_from_stack:.0f} фишек")
+            else:
+                self.kelly_label_f.config(
+                    text=f"Келли (Kelly Fraction, f): {kelly_fraction * 100:.2f}% (b = {payout_ratio:.2f})")
+                self.kelly_label_amount.config(text="Оптимальная Ставка по Келли: f ≈ 0. Ставка не оптимальна.")
+        else:
+            self.kelly_label_f.config(text="Келли (Kelly Fraction, f) - Только Ривер/Рейз: Не применимо.")
+            self.kelly_label_amount.config(text="Оптимальная Ставка по Келли (от Стека): -")
+
+
+if __name__ == "__main__":
+    app = PokerEquityCalculator()
+    app.mainloop()
